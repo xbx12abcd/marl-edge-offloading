@@ -1,0 +1,109 @@
+# ============================================================
+# MARL Edge Offloading - Default Configuration
+# ============================================================
+
+# Environment Settings
+environment:
+  # Network topology
+  num_edge_servers: 5
+  num_end_devices: 10
+  num_time_slots: 100
+  
+  # Task parameters
+  num_tasks: 20
+  task_cpu_min: 100  # CPU cycles (Million)
+  task_cpu_max: 500
+  task_data_min: 1.0  # Data size (MB)
+  task_data_max: 10.0
+  task_deadline_min: 5  # Time slots
+  task_deadline_max: 15
+  
+  # Network parameters
+  bandwidth_wireless: 50.0  # Mbps
+  bandwidth_wired: 100.0     # Mbps
+  transmission_delay: 0.01   # seconds
+  
+  # Computation resources
+  device_cpu_capacity: 1000   # Million cycles per time slot
+  server_cpu_capacity: 5000   # Million cycles per time slot
+  
+  # Energy consumption
+  device_energy_per_cpu: 0.01  # Joules per Million cycles
+  device_energy_per_bit: 0.0001  # Joules per bit
+  server_energy_per_cpu: 0.005
+  
+  # Observation space
+  state_dim: 64
+
+# MARL Training Settings
+marl:
+  algorithm: "IPPO"  # IPPO, QMIX, etc.
+  total_episodes: 10000
+  episode_length: 100
+  
+  # Agent-specific settings
+  num_agents: 10  # Number of learning agents
+  agent_type: "decentralized"  # decentralized or hierarchical
+  
+  # Network architecture
+  hidden_dim: 128
+  num_layers: 2
+  
+  # Communication settings (for later phases)
+  enable_communication: false
+  comm_bandwidth: 10.0  # Kbps
+  max_message_size: 64  # bits
+
+# IPPO Algorithm Parameters
+algorithm:
+  type: "IPPO"
+  learning_rate: 1e-4
+  gamma: 0.99  # Discount factor
+  gae_lambda: 0.95  # GAE parameter
+  clip_ratio: 0.2  # PPO clip parameter
+  entropy_coeff: 0.01
+  value_coeff: 0.5
+  max_grad_norm: 0.5
+  
+  # Training batch size
+  batch_size: 64
+  num_epochs: 4
+  
+  # Optimizer
+  optimizer: "adam"
+
+# Reward Shaping
+reward:
+  task_completion_weight: 0.4
+  energy_efficiency_weight: 0.3
+  deadline_penalty_weight: 0.2
+  fairness_weight: 0.1
+  
+  # Penalty values
+  deadline_miss_penalty: -10.0
+  energy_penalty_per_unit: -0.1
+  fairness_penalty_coeff: 0.5
+
+# Evaluation Metrics
+evaluation:
+  metrics:
+    - "task_success_rate"
+    - "average_energy_consumption"
+    - "average_task_delay"
+    - "system_fairness"
+    - "resource_utilization"
+  
+  eval_episodes: 100
+  save_interval: 100
+
+# Logging and Output
+logging:
+  log_level: "INFO"
+  log_dir: "./logs"
+  tensorboard_dir: "./runs"
+  save_model_interval: 200
+  checkpoint_dir: "./checkpoints"
+
+# Random Seed
+seed: 42
+device: "cuda"  # cuda or cpu

@@ -1,0 +1,60 @@
+# ============================================================
+# Explaboff Scheme Configuration (with Mutual Information)
+# ============================================================
+
+# Inherits from default_config.yaml with these modifications:
+
+algorithm:
+  type: "IPPO_MI"  # IPPO with Mutual Information
+  learning_rate: 5e-5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_ratio: 0.2
+  entropy_coeff: 0.01
+  value_coeff: 0.5
+  max_grad_norm: 0.5
+  
+  # Mutual Information Maximization
+  mi_weight: 0.5  # Weight for MI loss
+  mi_estimator: "nwj"  # Noise-contrastive estimation or DV divergence
+  
+  batch_size: 64
+  num_epochs: 4
+
+# Communication for Mutual Information Exchange
+communication:
+  enable_communication: true
+  comm_bandwidth: 50.0  # Increased bandwidth for MI exchange
+  max_message_size: 256
+  
+  # MI-based agent selection
+  top_k_agents: 3  # Number of agents to communicate with
+  comm_method: "attention"  # attention or broadcast
+  
+  # Explainability settings
+  enable_explainability: true
+  explain_method: "attention_weights"  # attention_weights or SHAP
+
+reward:
+  task_completion_weight: 0.3
+  energy_efficiency_weight: 0.25
+  deadline_penalty_weight: 0.15
+  fairness_weight: 0.15
+  mutual_information_weight: 0.15  # New: MI-based reward bonus
+  
+  deadline_miss_penalty: -10.0
+  energy_penalty_per_unit: -0.1
+  fairness_penalty_coeff: 0.5
+
+evaluation:
+  metrics:
+    - "task_success_rate"
+    - "average_energy_consumption"
+    - "average_task_delay"
+    - "system_fairness"
+    - "resource_utilization"
+    - "mutual_information"  # New metric
+    - "explainability_score"  # New metric
+  
+  eval_episodes: 100
+  save_interval: 100

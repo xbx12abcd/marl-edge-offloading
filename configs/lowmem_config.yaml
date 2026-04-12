@@ -1,0 +1,118 @@
+# ============================================================
+# Low Memory Configuration for RTX 4060 Ti (8GB VRAM)
+# 针对中小型显卡的优化配置
+# ============================================================
+
+# 环境设置 - 缩小规模以适应有限显存
+environment:
+  # 网络拓扑 - 减少设备数量
+  num_edge_servers: 2          # 降低：5 → 2
+  num_end_devices: 5           # 降低：10 → 5
+  num_time_slots: 50           # 降低：100 → 50
+  
+  # 任务参数 - 减少任务数量
+  num_tasks: 10                # 降低：20 → 10
+  task_cpu_min: 100            # 保持
+  task_cpu_max: 500            # 保持
+  task_data_min: 1.0           # 保持
+  task_data_max: 10.0          # 保持
+  task_deadline_min: 5         # 保持
+  task_deadline_max: 15        # 保持
+  
+  # 网络参数
+  bandwidth_wireless: 50.0
+  bandwidth_wired: 100.0
+  transmission_delay: 0.01
+  
+  # 计算资源
+  device_cpu_capacity: 1000
+  server_cpu_capacity: 5000
+  
+  # 能量消耗参数
+  device_energy_per_cpu: 0.01
+  device_energy_per_bit: 0.0001
+  server_energy_per_cpu: 0.005
+  
+  # 观测空间 - 减小维度
+  state_dim: 32                # 降低：64 → 32
+
+# MARL训练设置 - 低显存优化
+marl:
+  algorithm: "IPPO"
+  total_episodes: 500          # 降低：10000 → 500
+  episode_length: 50           # 降低：100 → 50
+  
+  # 智能体设置 - 减少智能体数量
+  num_agents: 3                # 降低：10 → 3
+  agent_type: "decentralized"
+  
+  # 通信设置
+  enable_communication: false
+  comm_bandwidth: 10.0
+  max_message_size: 64
+
+# IPPO算法参数 - 低显存优化
+algorithm:
+  type: "IPPO"
+  # 网络架构 - 显著减小
+  hidden_dim: 32               # 降低：128 → 32
+  num_layers: 1                # 降低：2 → 1
+  learning_rate: 0.001        # 增加：1e-4 → 1e-3（更快适应）
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_ratio: 0.2
+  entropy_coeff: 0.01
+  value_coeff: 0.5
+  max_grad_norm: 0.5
+  
+  # 训练参数 - 显存优化
+  batch_size: 8                # 大幅降低：64 → 8
+  num_epochs: 2                # 降低：4 → 2
+  
+  optimizer: "adam"
+  
+  # 显存优化选项
+  use_mixed_precision: true    # 启用混合精度训练
+  gradient_accumulation_steps: 4  # 梯度累积
+  enable_gradient_checkpointing: false  # 保留为false（简单模型用不到）
+
+# 奖励设置
+reward:
+  task_completion_weight: 0.4
+  energy_efficiency_weight: 0.3
+  deadline_penalty_weight: 0.2
+  fairness_weight: 0.1
+  
+  deadline_miss_penalty: -10.0
+  energy_penalty_per_unit: -0.1
+  fairness_penalty_coeff: 0.5
+
+# 评估设置
+evaluation:
+  metrics:
+    - "task_success_rate"
+    - "average_energy_consumption"
+    - "average_task_delay"
+    - "system_fairness"
+    - "resource_utilization"
+  
+  eval_episodes: 10            # 降低：100 → 10
+  save_interval: 50            # 降低：100 → 50
+
+# 日志和输出
+logging:
+  log_level: "INFO"
+  log_dir: "./logs"
+  tensorboard_dir: "./runs"
+  save_model_interval: 50
+  checkpoint_dir: "./checkpoints"
+  
+  # 显存监控
+  monitor_memory: true         # 启用显存监控
+  memory_check_interval: 10    # 每10步检查一次显存
+
+# 系统设置
+seed: 42
+device: "cuda"                 # 优先使用CUDA
+use_cpu_fallback: true         # 显存不足时自动回退到CPU
+mixed_precision_dtype: "float16"  # 混合精度使用FP16
