@@ -14,10 +14,27 @@ from .task_device import Task
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from YAML file."""
-    with open(config_path, 'r', encoding='utf-8') as f:
+    """Load configuration from YAML file with automatic type conversion."""
+    with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    config = _convert_scientific_notation(config)
     return config
+
+
+def _convert_scientific_notation(obj):
+    """Recursively convert scientific notation strings to floats."""
+    import re
+    scientific_pattern = re.compile(r"^[+-]?(\d+\.?\d*|\d*\.?\d+)[eE][+-]?\d+$")
+    if isinstance(obj, dict):
+        return {k: _convert_scientific_notation(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_scientific_notation(item) for item in obj]
+    elif isinstance(obj, str):
+        if scientific_pattern.match(obj):
+            return float(obj)
+        return obj
+    else:
+        return obj
 
 
 def set_seed(seed: int):

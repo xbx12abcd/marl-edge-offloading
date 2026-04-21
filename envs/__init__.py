@@ -1,7 +1,5 @@
-"""
-__init__.py for envs package
-"""
+"""Environment package exports."""
 
-from .edge_env import EdgeComputingEnv
+from .edge_env import EdgeComputingEnv, EdgeOffloadingEnv
 
-__all__ = ['EdgeComputingEnv']
+__all__ = ['EdgeComputingEnv', 'EdgeOffloadingEnv']

@@ -333,6 +333,129 @@ class ExplaboffAgent:
         
         return adjusted_rewards
     
+    def select_action(self, state: np.ndarray):
+        """
+        Select action without communication (standard PPO interface).
+        Wraps select_action_with_communication with no peer states.
+
+        Returns:
+            Tuple of (action, log_prob, value)
+        """
+        action, log_prob, value, _ = self.select_action_with_communication(
+            state, all_agent_states=None
+        )
+        return action, log_prob, value
+
+    def compute_gae_advantages(
+        self,
+        rewards: np.ndarray,
+        values: np.ndarray,
+        dones: np.ndarray,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        next_value: float = 0.0,
+    ):
+        """GAE advantage estimation."""
+        values_ext = np.append(values, next_value)
+        deltas = rewards + gamma * values_ext[1:] * (1 - dones) - values_ext[:-1]
+        advantages = np.zeros_like(rewards)
+        gae = 0.0
+        for t in reversed(range(len(rewards))):
+            gae = deltas[t] + gamma * gae_lambda * (1 - dones[t]) * gae
+            advantages[t] = gae
+        returns = advantages + values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return advantages, returns
+
+    def update(
+        self,
+        batch_size: int = 64,
+        num_epochs: int = 4,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        clip_ratio: float = 0.2,
+        entropy_coeff: float = 0.01,
+        value_coeff: float = 0.5,
+        max_grad_norm: float = 0.5,
+    ):
+        """
+        PPO update incorporating MI-adjusted rewards.
+
+        Args:
+            batch_size: Mini-batch size
+            num_epochs: Number of update epochs over collected data
+            gamma / gae_lambda / clip_ratio / entropy_coeff / value_coeff / max_grad_norm:
+                Standard PPO hyper-parameters (use defaults if not stored on self).
+
+        Returns:
+            Dict with average loss values, or empty dict if no data.
+        """
+        if not self.trajectory.get('states'):
+            return {}
+
+        states = np.array(self.trajectory['states'])
+        actions = np.array(self.trajectory['actions'])
+        old_log_probs = np.array(self.trajectory['log_probs'])
+        values = np.array(self.trajectory['values'])
+        dones = np.array(self.trajectory['dones'], dtype=np.float32)
+
+        # MI-adjusted rewards
+        rewards = self.compute_rewards_with_mi()
+
+        advantages, returns = self.compute_gae_advantages(
+            rewards, values, dones, gamma, gae_lambda
+        )
+
+        states_t = torch.from_numpy(states).float().to(self.device)
+        actions_t = torch.from_numpy(actions).long().to(self.device)
+        old_lp_t = torch.from_numpy(old_log_probs).float().to(self.device)
+        adv_t = torch.from_numpy(advantages).float().to(self.device)
+        ret_t = torch.from_numpy(returns).float().to(self.device)
+
+        losses = {'total': [], 'policy': [], 'value': [], 'entropy': []}
+        n = len(states)
+
+        for _ in range(num_epochs):
+            idx = np.random.permutation(n)
+            for start in range(0, n, batch_size):
+                b = idx[start: start + batch_size]
+                bs, ba, blp, badv, bret = (
+                    states_t[b], actions_t[b], old_lp_t[b], adv_t[b], ret_t[b]
+                )
+
+                action_probs, vals = self.network(bs)
+                dist = torch.distributions.Categorical(action_probs)
+                new_lp = dist.log_prob(ba)
+                entropy = dist.entropy().mean()
+
+                ratio = torch.exp(new_lp - blp)
+                surr1 = ratio * badv
+                surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * badv
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss = torch.nn.functional.mse_loss(vals.squeeze(), bret)
+                total_loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
+
+                self.optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for pg in self.optimizer.param_groups for p in pg['params']],
+                    max_grad_norm,
+                )
+                self.optimizer.step()
+
+                losses['total'].append(total_loss.item())
+                losses['policy'].append(policy_loss.item())
+                losses['value'].append(value_loss.item())
+                losses['entropy'].append(entropy.item())
+
+        # Clear trajectory
+        self.trajectory = {
+            'states': [], 'actions': [], 'rewards': [],
+            'values': [], 'log_probs': [], 'dones': [], 'mi_values': []
+        }
+
+        return {k: float(np.mean(v)) for k, v in losses.items()}
+
     def get_explainability_weights(self) -> np.ndarray:
         """
         Get attention weights for explainability.

@@ -1,284 +1,352 @@
 """
-Evaluation script for trained IPPO models.
-加载checkpoint文件并评估模型性能或进行推演演示。
+Evaluation script for trained models (IPPO / GNN-PPO).
+
+Auto-detects checkpoint format and loads the correct network:
+  - {"networks": {agent_id: state_dict}}  → new train_ippo.py (SimplePPO)
+  - {"network": state_dict}               → train_scalable.py (GNNPPOTrainer)
+  - {"agents": [state_dict, ...]}         → legacy train_ippo.py (PPOAgent)
 """
 
-import os
-import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import torch
-import numpy as np
-from pathlib import Path
-import json
 import argparse
-from tqdm import tqdm
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
 
 from utils import load_config, set_seed
-from envs import EdgeComputingEnv
-from agents import PPOAgent
+from envs import EdgeOffloadingEnv, EdgeComputingEnv
 from utils.gpu_monitor import get_device_with_memory_info
 
 
-def load_checkpoint(agent: PPOAgent, checkpoint_path: str):
-    """加载checkpoint到agent"""
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+# ---------------------------------------------------------------------------
+# Checkpoint loading helpers
+# ---------------------------------------------------------------------------
 
-    # checkpoint格式: {'episode': int, 'agents': [state_dict, ...], 'config': dict}
-    if 'agents' in checkpoint and isinstance(checkpoint['agents'], list):
-        # 使用第一个agent的网络状态
-        agent.network.load_state_dict(checkpoint['agents'][0])
-        print(f"✓ Loaded checkpoint: {checkpoint_path} (episode {checkpoint.get('episode', 'unknown')})")
-    elif 'network_state_dict' in checkpoint:
-        agent.network.load_state_dict(checkpoint['network_state_dict'])
-        print(f"✓ Loaded checkpoint: {checkpoint_path}")
-    elif 'model_state_dict' in checkpoint:
-        agent.network.load_state_dict(checkpoint['model_state_dict'])
-        print(f"✓ Loaded checkpoint: {checkpoint_path}")
-    else:
-        # 尝试直接加载（兼容旧格式）
-        try:
-            agent.network.load_state_dict(checkpoint)
-            print(f"✓ Loaded checkpoint: {checkpoint_path}")
-        except:
-            print(f"✗ Unknown checkpoint format in {checkpoint_path}")
-            print(f"Available keys: {list(checkpoint.keys()) if isinstance(checkpoint, dict) else 'not a dict'}")
-            raise
+def _detect_format(ckpt: dict) -> str:
+    """Return checkpoint format tag."""
+    if "networks" in ckpt:
+        return "simple_ppo"        # new train_ippo.py
+    if "network" in ckpt:
+        return "gnn_ppo"           # train_scalable.py
+    if "agents" in ckpt and isinstance(ckpt["agents"], list):
+        return "legacy_ppo"        # old train_ippo.py
+    return "unknown"
 
+
+def _load_config_for_checkpoint(checkpoint_path: Path, config_path: str = None) -> dict:
+    if config_path and Path(config_path).exists():
+        return load_config(config_path)
+    # Auto-detect: walk up to experiment root
+    exp_dir = checkpoint_path.parent.parent
+    auto = exp_dir / "config.yaml"
+    if auto.exists():
+        return load_config(str(auto))
+    raise FileNotFoundError(
+        f"Cannot find config.yaml. Pass --config explicitly.\n"
+        f"Looked in: {auto}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Format-specific inference helpers
+# ---------------------------------------------------------------------------
+
+def _make_simple_ppo_runner(ckpt: dict, config: dict, device: torch.device):
+    """Load SimplePPO networks from new train_ippo.py checkpoint."""
+    from train_ippo import ActorCritic, _get_config_value
+
+    obs_dim = config["environment"]["state_dim"]
+    hidden_dim = _get_config_value(
+        config, ("marl", "hidden_dim"), ("algorithm", "hidden_dim")
+    )
+
+    networks = {}
+    for agent_id, state_dict in ckpt["networks"].items():
+        # Infer action_dim from first Linear layer output of actor
+        first_key = list(state_dict.keys())[0]
+        # actor.4.weight has shape (action_dim, hidden_dim)
+        action_dim = None
+        for k, v in state_dict.items():
+            if "actor.4.weight" in k:
+                action_dim = v.shape[0]
+                break
+        if action_dim is None:
+            # fallback: count from config
+            action_dim = config["environment"]["num_edge_servers"] + 1
+
+        net = ActorCritic(obs_dim, action_dim, hidden_dim).to(device)
+        net.load_state_dict(state_dict)
+        net.eval()
+        networks[agent_id] = net
+
+    def select_actions(obs_dict):
+        actions = {}
+        with torch.no_grad():
+            for agent_id, obs in obs_dict.items():
+                if agent_id not in networks:
+                    actions[agent_id] = 0
+                    continue
+                t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                action, _, _ = networks[agent_id].get_action(t)
+                actions[agent_id] = action.item()
+        return actions
+
+    return select_actions, list(networks.keys())
+
+
+def _make_gnn_runner(ckpt: dict, config: dict, device: torch.device):
+    """Load GNNActorCritic from train_scalable.py checkpoint."""
+    from agents.gnn_agent import GNNActorCritic, GNNPPOTrainer
+
+    num_agents = config["environment"]["num_end_devices"]
+    obs_dim = config["environment"]["state_dim"]
+    action_dim = config["environment"]["num_edge_servers"] + 1
+    hidden_dim = config["marl"].get("hidden_dim") or config.get("algorithm", {}).get("hidden_dim", 128)
+    gnn_layers = config["marl"].get("gnn_layers", 2)
+    num_heads = config["marl"].get("gnn_heads", 4)
+
+    net = GNNActorCritic(obs_dim, action_dim, hidden_dim, gnn_layers, num_heads).to(device)
+    net.load_state_dict(ckpt["network"])
+    net.eval()
+
+    adj = torch.ones(num_agents, num_agents, dtype=torch.float32, device=device)
+
+    agent_ids = [f"agent_{i}" for i in range(num_agents)]
+
+    def select_actions(obs_dict):
+        obs_list = [obs_dict.get(aid, np.zeros(obs_dim)) for aid in agent_ids]
+        obs_t = torch.as_tensor(
+            np.stack(obs_list), dtype=torch.float32, device=device
+        )
+        with torch.no_grad():
+            actions, _, _ = net.get_actions(obs_t, adj)
+        return {aid: actions[i].item() for i, aid in enumerate(agent_ids)}
+
+    return select_actions, agent_ids
+
+
+def _make_legacy_runner(ckpt: dict, config: dict, device: torch.device):
+    """Load old PPOAgent checkpoint (agents list)."""
+    from agents import PPOAgent
+
+    hidden_dim = (
+        config["marl"].get("hidden_dim")
+        or config.get("algorithm", {}).get("hidden_dim", 128)
+    )
+    env_tmp = EdgeComputingEnv(config)
+    action_dim = env_tmp.action_space.n
+    env_tmp.close()
+
+    agent = PPOAgent(
+        agent_id=0,
+        state_dim=config["environment"]["state_dim"],
+        action_dim=action_dim,
+        hidden_dim=hidden_dim,
+        learning_rate=config["algorithm"]["learning_rate"],
+        gamma=config["algorithm"]["gamma"],
+        gae_lambda=config["algorithm"]["gae_lambda"],
+        clip_ratio=config["algorithm"]["clip_ratio"],
+        entropy_coeff=config["algorithm"]["entropy_coeff"],
+        value_coeff=config["algorithm"]["value_coeff"],
+        max_grad_norm=config["algorithm"]["max_grad_norm"],
+        device=device,
+    )
+    agent.network.load_state_dict(ckpt["agents"][0])
     agent.network.eval()
+
+    # Single-agent wrapper: feed same obs to all, use agent_0 action
+    def select_actions(obs_dict):
+        first_obs = next(iter(obs_dict.values()))
+        action, _, _ = agent.select_action(first_obs)
+        return {aid: action for aid in obs_dict}
+
+    return select_actions, list(obs_dict.keys()) if False else ["agent_0"]
+
+
+# ---------------------------------------------------------------------------
+# Unified evaluate / demonstrate
+# ---------------------------------------------------------------------------
+
+def _build_runner(checkpoint_path: Path, config: dict, device: torch.device):
+    ckpt = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+    fmt = _detect_format(ckpt)
+    print(f"  Checkpoint format : {fmt}")
+
+    if fmt == "simple_ppo":
+        return _make_simple_ppo_runner(ckpt, config, device)
+    elif fmt == "gnn_ppo":
+        return _make_gnn_runner(ckpt, config, device)
+    elif fmt == "legacy_ppo":
+        return _make_legacy_runner(ckpt, config, device)
+    else:
+        raise ValueError(
+            f"Unknown checkpoint format. Keys found: {list(ckpt.keys())}"
+        )
+
+
 def evaluate_model(
     checkpoint_path: str,
     config_path: str = None,
     num_episodes: int = 10,
     render: bool = False,
-    save_results: bool = True
+    save_results: bool = True,
 ):
-    """
-    评估训练好的模型
-
-    Args:
-        checkpoint_path: checkpoint文件路径
-        config_path: 配置文件路径（可选，会从实验目录自动查找）
-        num_episodes: 评估的episode数量
-        render: 是否显示推演过程
-        save_results: 是否保存结果
-    """
-
     print("=" * 80)
-    print("IPPO Model Evaluation")
+    print("Model Evaluation")
     print("=" * 80)
 
-    # 确定配置文件路径
-    if config_path is None:
-        # 从checkpoint路径推断实验目录
-        checkpoint_path = Path(checkpoint_path)
-        exp_dir = checkpoint_path.parent.parent
-        config_path = exp_dir / "config.yaml"
-
-    if not Path(config_path).exists():
-        print(f"✗ Config file not found: {config_path}")
-        return
-
-    # 加载配置
-    config = load_config(str(config_path))
-    set_seed(config['seed'])
-
-    # 获取设备
+    checkpoint_path = Path(checkpoint_path)
+    config = _load_config_for_checkpoint(checkpoint_path, config_path)
+    set_seed(config.get("seed", 42))
     device = get_device_with_memory_info()
 
-    # 创建环境
     print("\nInitializing environment...")
-    env = EdgeComputingEnv(config)
+    env = EdgeOffloadingEnv(config)
+    select_actions, _ = _build_runner(checkpoint_path, config, device)
 
-    # 创建agent
-    agent = PPOAgent(
-        agent_id=0,
-        state_dim=config['environment']['state_dim'],
-        action_dim=env.action_space.n,
-        hidden_dim=config['algorithm']['hidden_dim'],
-        learning_rate=config['algorithm']['learning_rate'],
-        gamma=config['algorithm']['gamma'],
-        gae_lambda=config['algorithm']['gae_lambda'],
-        clip_ratio=config['algorithm']['clip_ratio'],
-        entropy_coeff=config['algorithm']['entropy_coeff'],
-        value_coeff=config['algorithm']['value_coeff'],
-        max_grad_norm=config['algorithm']['max_grad_norm'],
-        device=device
-    )
-
-    # 加载checkpoint
-    load_checkpoint(agent, str(checkpoint_path))
-
-    # 评估循环
-    print(f"\nEvaluating {num_episodes} episodes...")
+    episode_length = config["marl"]["episode_length"]
     all_metrics = {
-        'task_completion_rate': [],
-        'average_energy_consumption': [],
-        'average_task_delay': [],
-        'total_reward': []
+        "task_completion_rate": [],
+        "energy_consumption": [],
+        "average_delay": [],
+        "deadline_miss_rate": [],
+        "fairness_index": [],
+        "total_reward": [],
     }
 
-    for episode in tqdm(range(num_episodes), desc="Evaluating"):
-        obs, _ = env.reset()
+    print(f"\nEvaluating {num_episodes} episodes...")
+    for ep in range(num_episodes):
+        observations, _ = env.reset()
         episode_reward = 0.0
-        done = False
-        step = 0
 
-        while not done and step < config['marl']['episode_length']:
-            # 选择动作
-            action, _, _ = agent.select_action(obs)
-
-            # 执行动作
-            next_obs, reward, terminated, truncated, info = env.step(action)
-            episode_reward += reward
-            done = terminated or truncated
+        for step in range(episode_length):
+            actions = select_actions(observations)
+            observations, rewards, terminations, truncations, _ = env.step(actions)
+            episode_reward += sum(rewards.values())
 
             if render:
-                print(f"Step {step}: Action={action}, Reward={reward:.4f}, Done={done}")
+                print(f"  ep={ep} step={step} reward={sum(rewards.values()):.3f}")
 
-            obs = next_obs
-            step += 1
+            if all(terminations.values()) or all(truncations.values()):
+                break
 
-        # 收集指标
         metrics = env.get_metrics()
-        for key in all_metrics.keys():
-            if key in metrics:
-                all_metrics[key].append(metrics[key])
-        all_metrics['total_reward'].append(episode_reward)
+        for k in all_metrics:
+            if k == "total_reward":
+                all_metrics[k].append(episode_reward)
+            elif k in metrics:
+                all_metrics[k].append(metrics[k])
 
-    # 计算平均指标
-    avg_metrics = {}
-    for key, values in all_metrics.items():
-        if values:
-            avg_metrics[key] = np.mean(values)
-        else:
-            avg_metrics[key] = 0.0
+    avg = {k: float(np.mean(v)) if v else 0.0 for k, v in all_metrics.items()}
 
-    # 打印结果
     print("\n" + "=" * 80)
     print("EVALUATION RESULTS")
     print("=" * 80)
-    for key, value in avg_metrics.items():
-        print(f"{key}: {value:.6f}")
+    labels = {
+        "task_completion_rate": "Task Completion Rate",
+        "energy_consumption":   "Energy Consumption (J)",
+        "average_delay":        "Average Delay (slots)",
+        "deadline_miss_rate":   "Deadline Miss Rate",
+        "fairness_index":       "Fairness Index (Jain)",
+        "total_reward":         "Avg Episode Reward",
+    }
+    for k, v in avg.items():
+        print(f"  {labels.get(k, k):<30}: {v:.6f}")
 
-    # 保存结果
     if save_results:
-        results_dir = Path(checkpoint_path).parent.parent / "evaluation"
-        results_dir.mkdir(exist_ok=True)
+        out_dir = checkpoint_path.parent.parent / "evaluation"
+        out_dir.mkdir(exist_ok=True)
+        out_file = out_dir / f"{checkpoint_path.stem}_evaluation.json"
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump({"checkpoint": str(checkpoint_path),
+                       "num_episodes": num_episodes,
+                       "metrics": avg}, f, indent=2)
+        print(f"\n  Results saved to: {out_file}")
 
-        checkpoint_name = Path(checkpoint_path).stem
-        results_file = results_dir / f"{checkpoint_name}_evaluation.json"
-
-        with open(results_file, 'w') as f:
-            json.dump({
-                'checkpoint': str(checkpoint_path),
-                'num_episodes': num_episodes,
-                'metrics': avg_metrics,
-                'individual_episodes': all_metrics
-            }, f, indent=2)
-
-        print(f"\n✓ Results saved to: {results_file}")
-
-    return avg_metrics
+    return avg
 
 
 def demonstrate_model(
     checkpoint_path: str,
     config_path: str = None,
-    num_steps: int = 100,
-    delay: float = 0.5
+    num_steps: int = 50,
+    delay: float = 0.5,
 ):
-    """
-    演示模型推演过程
-
-    Args:
-        checkpoint_path: checkpoint文件路径
-        config_path: 配置文件路径
-        num_steps: 演示的步数
-        delay: 每步之间的延迟（秒）
-    """
-
     print("=" * 80)
-    print("IPPO Model Demonstration")
+    print("Model Demonstration")
     print("=" * 80)
 
-    # 确定配置文件路径
-    if config_path is None:
-        checkpoint_path = Path(checkpoint_path)
-        exp_dir = checkpoint_path.parent.parent
-        config_path = exp_dir / "config.yaml"
-
-    # 加载配置和模型
-    config = load_config(str(config_path))
-    set_seed(config['seed'])
+    checkpoint_path = Path(checkpoint_path)
+    config = _load_config_for_checkpoint(checkpoint_path, config_path)
+    set_seed(config.get("seed", 42))
     device = get_device_with_memory_info()
 
-    env = EdgeComputingEnv(config)
+    env = EdgeOffloadingEnv(config)
+    select_actions, agent_ids = _build_runner(checkpoint_path, config, device)
 
-    agent = PPOAgent(
-        agent_id=0,
-        state_dim=config['environment']['state_dim'],
-        action_dim=env.action_space.n,
-        hidden_dim=config['algorithm']['hidden_dim'],
-        learning_rate=config['algorithm']['learning_rate'],
-        gamma=config['algorithm']['gamma'],
-        gae_lambda=config['algorithm']['gae_lambda'],
-        clip_ratio=config['algorithm']['clip_ratio'],
-        entropy_coeff=config['algorithm']['entropy_coeff'],
-        value_coeff=config['algorithm']['value_coeff'],
-        max_grad_norm=config['algorithm']['max_grad_norm'],
-        device=device
-    )
+    print(f"\n  Agents : {len(agent_ids)}")
+    print(f"  Steps  : {num_steps}")
+    print("\nStarting demonstration...\n")
 
-    load_checkpoint(agent, str(checkpoint_path))
-
-    # 演示
-    print("\nStarting demonstration...")
-    obs, _ = env.reset()
+    observations, _ = env.reset()
     total_reward = 0.0
 
     for step in range(num_steps):
-        # 选择动作
-        action, log_prob, value = agent.select_action(obs)
+        actions = select_actions(observations)
+        observations, rewards, terminations, truncations, infos = env.step(actions)
+        step_reward = sum(rewards.values())
+        total_reward += step_reward
 
-        # 执行动作
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
+        # Summarise this step
+        completed = sum(1 for info in infos.values() if info.get("completed"))
+        server_loads = infos[agent_ids[0]].get("server_loads", [])
+        loads_str = " ".join(f"{x:.2f}" for x in server_loads)
 
-        # 显示信息
-        print(f"\nStep {step + 1}:")
-        print(f"  Action: {action}")
-        print(f"  Reward: {reward:.4f}")
-        print(f"  Total Reward: {total_reward:.4f}")
-        print(f"  Done: {terminated or truncated}")
+        print(f"Step {step + 1:>3}  |  "
+              f"reward={step_reward:+.3f}  "
+              f"completed={completed}/{len(agent_ids)}  "
+              f"server_loads=[{loads_str}]  "
+              f"total={total_reward:+.2f}")
 
-        # 显示环境状态
-        metrics = env.get_metrics()
-        print(f"  Task Completion: {metrics.get('task_completion_rate', 0):.3f}")
-        print(f"  Energy Consumption: {metrics.get('average_energy_consumption', 0):.3f}")
-
-        if terminated or truncated:
-            print("\nEpisode finished!")
+        if all(terminations.values()) or all(truncations.values()):
+            print("\n  Episode finished early.")
             break
 
-        obs = next_obs
-
         if delay > 0:
-            import time
             time.sleep(delay)
 
-    print(f"\nFinal Total Reward: {total_reward:.4f}")
+    print("\n" + "=" * 80)
+    metrics = env.get_metrics()
+    print(f"  Task Completion Rate : {metrics['task_completion_rate']:.4f}")
+    print(f"  Fairness Index       : {metrics['fairness_index']:.4f}")
+    print(f"  Energy Consumption   : {metrics['energy_consumption']:.2f} J")
+    print(f"  Avg Delay            : {metrics['average_delay']:.4f} slots")
+    print(f"  Total Reward         : {total_reward:.4f}")
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate trained IPPO models")
-    parser.add_argument("checkpoint", help="Path to checkpoint file (.pt)")
-    parser.add_argument("--config", help="Path to config file (optional)")
-    parser.add_argument("--episodes", type=int, default=10, help="Number of evaluation episodes")
-    parser.add_argument("--render", action="store_true", help="Render demonstration")
-    parser.add_argument("--demo", action="store_true", help="Run demonstration mode")
-    parser.add_argument("--steps", type=int, default=50, help="Number of demonstration steps")
-    parser.add_argument("--delay", type=float, default=0.5, help="Delay between steps in demo")
+    parser = argparse.ArgumentParser(
+        description="Evaluate or demonstrate a trained MARL checkpoint"
+    )
+    parser.add_argument("checkpoint", help="Path to .pt checkpoint file")
+    parser.add_argument("--config", default=None,
+                        help="Config YAML (auto-detected from experiment dir if omitted)")
+    parser.add_argument("--episodes", type=int, default=10,
+                        help="Number of evaluation episodes (default: 10)")
+    parser.add_argument("--render", action="store_true",
+                        help="Print per-step rewards during evaluation")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run demonstration mode (step-by-step output)")
+    parser.add_argument("--steps", type=int, default=50,
+                        help="Number of steps in demo mode (default: 50)")
+    parser.add_argument("--delay", type=float, default=0.5,
+                        help="Seconds between steps in demo mode (default: 0.5)")
 
     args = parser.parse_args()
 
@@ -287,14 +355,14 @@ def main():
             checkpoint_path=args.checkpoint,
             config_path=args.config,
             num_steps=args.steps,
-            delay=args.delay
+            delay=args.delay,
         )
     else:
         evaluate_model(
             checkpoint_path=args.checkpoint,
             config_path=args.config,
             num_episodes=args.episodes,
-            render=args.render
+            render=args.render,
         )
 
 

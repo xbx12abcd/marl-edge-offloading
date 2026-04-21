@@ -1,4 +1,94 @@
-# GPU优化工作完成总结
+# Session 2026-04-21：架构重构 + Stage 3 GNN + ExplaboffAgent 修复
+
+**完成日期**: 2026年4月21日 | **项目**: MARL边缘计算  
+**目标**: 合并 PettingZoo 迁移 PR、推进 Stage 3、修复评估脚本  
+**状态**: ✅ 已完成
+
+---
+
+## 📋 本次会话完成内容
+
+### 1. PettingZoo 架构迁移（PR #1 合并）
+
+合并协作者 Neko-Yukari 提交的 PR #1，并修复合并过程中的兼容性问题。
+
+| 文件 | 变更内容 |
+|------|---------|
+| `envs/edge_env.py` | 全量重写：主类改为 `EdgeOffloadingEnv`（PettingZoo `ParallelEnv`），保留 `EdgeComputingEnv` 兼容包装器；修复奖励计算、服务器负载衰减 ×0.95/步 |
+| `envs/__init__.py` | 同时导出 `EdgeOffloadingEnv`、`EdgeComputingEnv` |
+| `train_ippo.py` | 全量重写：`ActorCritic` + `SimplePPO`，PettingZoo 原生接口，GAE 归一化 |
+| `utils/helpers.py` | `load_config` 新增 `_convert_scientific_notation`，自动解析 YAML 科学计数法字符串 |
+| `requirements.txt` | 新增 `pettingzoo>=1.25.0` |
+| `quick_start.py` | 修复 `hidden_dim` 配置路径，移除 `sys.path` 手动注入 |
+
+### 2. Stage 3 GNN 大规模场景实现（新增文件）
+
+| 文件 | 内容 |
+|------|------|
+| `agents/gnn_agent.py` | 新增：`GraphAttentionLayer`（单头 GAT）→ `MultiHeadGAT`（4头拼接）→ `GNNActorCritic`（参数共享 Actor-Critic）→ `GNNPPOTrainer`（含 GAE + PPO 更新） |
+| `train_scalable.py` | 新增：50+ 智能体大规模训练脚本，动态拓扑扩展，TensorBoard 集成，通信开销估算 |
+
+### 3. 评估脚本重写与修复
+
+| 文件 | 修复内容 |
+|------|---------|
+| `evaluate_checkpoint.py` | 全量重写：自动检测检查点格式（`simple_ppo` / `gnn_ppo` / `legacy_ppo`），支持 IPPO、GNN-PPO、旧版 PPO 三种格式；新增 `demonstrate_model` 逐步演示模式 |
+| `evaluate_compare.py` | 全量重写：修复原版「只推理不训练」导致两算法结果相同的问题；支持 `--ippo_ckpt` / `--explaboff_ckpt` 加载预训练权重跳过训练阶段 |
+
+### 4. ExplaboffAgent 补全（关键 Bug 修复）
+
+**问题**：`evaluate_compare.py` 调用 `agent.update()` 和 `agent.select_action()` 时抛出 `AttributeError`，因为 `ExplaboffAgent` 原实现缺少这两个方法。
+
+**修复文件**：`agents/explaboff_agent.py`
+
+新增三个方法：
+
+| 方法 | 说明 |
+|------|------|
+| `select_action(state)` | 标准 PPO 接口包装，内部调用 `select_action_with_communication(state, None)`，返回 `(action, log_prob, value)` |
+| `compute_gae_advantages(...)` | 向量化 GAE 计算，与 `PPOAgent` 逻辑一致 |
+| `update(batch_size, num_epochs, ...)` | 完整 PPO 更新，**先调用 `compute_rewards_with_mi()` 将 MI 奖励融入 reward**，再计算 GAE → PPO 裁剪 + 价值损失 + 熵正则化 |
+
+同步修复 `evaluate_compare.py` 的 `_run_episode`：按智能体类型分别调用 `store_transition`，确保 `ExplaboffAgent` 每步的 `mi_value` 正确传入轨迹缓存。
+
+### 5. 文档更新
+
+- `README.md`：整体进度 80% → 82%，更新 `evaluate_compare.py` 用法，增加 MI 奖励行到对比表
+- `PROJECT_STAGES.md`：整体进度 80% → 82%，新增 ExplaboffAgent 修复详细说明，更新执行命令和提交检查清单
+
+---
+
+## 🐛 本次修复的 Bug 汇总
+
+| Bug | 根因 | 修复方式 |
+|-----|------|---------|
+| `KeyError: 'hidden_dim'` (train_scalable.py) | `algorithm` 节无 `hidden_dim` 键 | 改用 `config["marl"].get("hidden_dim") or config.get("algorithm", {}).get("hidden_dim", 128)` |
+| evaluate_checkpoint.py 格式不匹配 | GNN 检查点被错误地加载进 `PPOAgent` | 自动检测格式，分支加载 |
+| evaluate_compare.py 两算法结果相同 | 原版只推理随机初始化权重 | 加入完整训练阶段 |
+| `AttributeError: 'ExplaboffAgent' has no attribute 'update'` | ExplaboffAgent 缺少 PPO 接口 | 新增 `select_action`、`compute_gae_advantages`、`update` 方法 |
+| MI 奖励未流入训练 | `store_transition` 未传 `mi_value` | `_run_episode` 按类型分支调用 |
+
+---
+
+## 📊 项目进度变化
+
+| 阶段 | 会话前 | 会话后 |
+|------|--------|--------|
+| Stage 1 IPPO | 100% ✅ | 100% ✅ |
+| Stage 2 Explaboff | 95%（缺接口） | 100% ✅ |
+| Stage 3 GNN | 50% | 75% 🔄 |
+| Stage 4 GUI | 0% | 0% 📅 |
+| **整体** | **~77%** | **~82%** |
+
+---
+
+**工作完成日期**: 2026-04-21  
+**项目状态**: Stage 2 全部完成，Stage 3 进行中（75%）  
+**下一步**: 运行 `python evaluate_compare.py --train 200 --eval 30` 验证对比结果；推进 Stage 3 剩余 25%（SHAP 可解释性、50 智能体训练验证）
+
+---
+
+## Session 2026-04-12：GPU 显存优化
 
 **完成日期**: 2026年4月12日 | **项目**: MARL边缘计算  
 **目标**: RTX 4060 Ti (8GB VRAM) 显存优化  
@@ -6,7 +96,7 @@
 
 ---
 
-## 📋 本次会话完成内容
+### 📋 完成内容
 
 ### 创建的文件 (8个)
 

@@ -1,315 +1,354 @@
 """
-IPPO Training Script - Independent PPO for Multi-Agent Edge Offloading
-Baseline implementation without inter-agent communication.
+IPPO Training Script - PettingZoo-native PPO for Multi-Agent Edge Offloading.
 
-This implements Stage 1 (30%) of the project: Build a simulation field and 
-use IPPO algorithm as baseline without any communications.
+Uses EdgeOffloadingEnv (PettingZoo ParallelEnv) as the canonical environment.
+Each end-device agent independently learns an Actor-Critic policy (IPPO).
 """
 
-import os
 import argparse
-import yaml
 import json
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 import torch
+import torch.nn as nn
+import yaml
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from envs import EdgeComputingEnv
-from agents import PPOAgent
-from utils import load_config, set_seed, MetricsCollector, get_device
+from envs import EdgeOffloadingEnv
+from utils import load_config, set_seed
 
 
-class IPPOTrainer:
-    """IPPO Trainer for multi-agent edge offloading."""
-    
-    def __init__(self, config: dict, experiment_name: str = None):
-        """
-        Initialize IPPO trainer.
-        
-        Args:
-            config: Configuration dictionary
-            experiment_name: Name for the experiment
-        """
-        self.config = config
-        self.device = get_device()
-        
-        # Set random seed
-        set_seed(config.get('seed', 42))
-        
-        # Create experiment directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.experiment_name = experiment_name or f"IPPO_{timestamp}"
-        self.experiment_dir = Path("results") / self.experiment_name
-        self.checkpoint_dir = self.experiment_dir / "checkpoints"
-        self.log_dir = self.experiment_dir / "logs"
-        
-        self.experiment_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize environment
-        self.env = EdgeComputingEnv(config)
-        
-        # Initialize agents
-        self.num_agents = config['marl']['num_agents']
-        self.agents = []
-        for i in range(self.num_agents):
-            agent = PPOAgent(
-                agent_id=i,
-                state_dim=config['environment']['state_dim'],
-                action_dim=self.env.action_space.n,
-                hidden_dim=config['algorithm']['hidden_dim'],
-                learning_rate=config['algorithm']['learning_rate'],
-                gamma=config['algorithm']['gamma'],
-                gae_lambda=config['algorithm']['gae_lambda'],
-                clip_ratio=config['algorithm']['clip_ratio'],
-                entropy_coeff=config['algorithm']['entropy_coeff'],
-                value_coeff=config['algorithm']['value_coeff'],
-                max_grad_norm=config['algorithm']['max_grad_norm'],
-                device=self.device
-            )
-            self.agents.append(agent)
-        
-        # Initialize metrics
-        self.metrics_collector = MetricsCollector()
-        
-        # TensorBoard writer
-        self.writer = SummaryWriter(str(self.log_dir))
-        
-        # Training parameters
-        self.total_episodes = config['marl']['total_episodes']
-        self.episode_length = config['marl']['episode_length']
-        self.batch_size = config['algorithm']['batch_size']
-        self.num_epochs = config['algorithm']['num_epochs']
-        self.save_interval = config['evaluation']['save_interval']
-        
-        # Save config
-        with open(self.experiment_dir / "config.yaml", 'w') as f:
-            yaml.dump(config, f)
-    
-    def train_episode(self) -> float:
-        """
-        Train one episode.
-        
-        Returns:
-            Average reward for the episode
-        """
-        obs, _ = self.env.reset()
-        episode_reward = 0.0
-        agent_rewards = [0.0] * self.num_agents
-        
-        for step in range(self.episode_length):
-            # Select actions for each agent
-            actions = []
-            values = []
-            log_probs = []
-            
-            for agent_idx, agent in enumerate(self.agents):
-                action, log_prob, value = agent.select_action(obs)
-                actions.append(action)
-                values.append(value)
-                log_probs.append(log_prob)
-            
-            # Environment step (using first agent's action for now)
-            next_obs, reward, terminated, truncated, info = self.env.step(actions[0])
-            
-            # Store transitions for each agent
-            for agent_idx, agent in enumerate(self.agents):
-                # Each agent gets the same reward (global reward) for simplicity
-                agent.store_transition(
-                    state=obs,
-                    action=actions[agent_idx],
-                    reward=reward,
-                    value=values[agent_idx],
-                    log_prob=log_probs[agent_idx],
-                    done=terminated
-                )
-                agent_rewards[agent_idx] += reward
-            
-            episode_reward += reward
-            obs = next_obs
-            
-            if terminated:
+def _get_config_value(config_dict, *candidate_paths):
+    """Retrieve a value from config trying multiple key paths."""
+    for path in candidate_paths:
+        value = config_dict
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
                 break
-        
-        # Update agents
-        for agent_idx, agent in enumerate(self.agents):
-            losses = agent.update(batch_size=self.batch_size, num_epochs=self.num_epochs)
-            if losses:
-                self.writer.add_scalar(f'agent_{agent_idx}/loss/total', losses['total_loss'], self.episode_count)
-                self.writer.add_scalar(f'agent_{agent_idx}/loss/policy', losses['policy_loss'], self.episode_count)
-                self.writer.add_scalar(f'agent_{agent_idx}/loss/value', losses['value_loss'], self.episode_count)
-        
-        return episode_reward / len(self.agents)
-    
-    def evaluate(self, num_episodes: int = 10) -> dict:
-        """
-        Evaluate trained agents.
-        
-        Args:
-            num_episodes: Number of evaluation episodes
-        
-        Returns:
-            Evaluation metrics
-        """
-        all_metrics = {
-            'task_completion_rate': [],
-            'energy_consumption': [],
-            'average_delay': [],
-            'deadline_miss_rate': [],
-            'fairness_index': []
+            value = value[key]
+        else:
+            return value
+    supported_paths = ", ".join(
+        "['" + "']['".join(path) + "']" for path in candidate_paths
+    )
+    raise KeyError(f"Missing required config value. Supported paths: {supported_paths}")
+
+
+def get_device(mode: str = "auto") -> torch.device:
+    if mode == "cpu":
+        print("✓ Using CPU (forced)")
+        return torch.device("cpu")
+    if mode == "cuda":
+        if torch.cuda.is_available():
+            print(f"✓ Using GPU: {torch.cuda.get_device_name(0)}")
+            return torch.device("cuda")
+        print("⚠ CUDA requested but not available, using CPU")
+        return torch.device("cpu")
+    if torch.cuda.is_available():
+        print(f"✓ Using GPU: {torch.cuda.get_device_name(0)}")
+        return torch.device("cuda")
+    print("✓ Using CPU")
+    return torch.device("cpu")
+
+
+def compute_gae(rewards, values, gamma=0.99, lam=0.95, device="cpu"):
+    """Generalized Advantage Estimation."""
+    rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32, device=device)
+    values_tensor = torch.as_tensor(values, dtype=torch.float32, device=device)
+
+    advantages = []
+    gae = 0
+    for index in reversed(range(len(rewards_tensor))):
+        delta = (
+            rewards_tensor[index]
+            + gamma * values_tensor[index + 1]
+            - values_tensor[index]
+        )
+        gae = delta + gamma * lam * gae
+        advantages.insert(0, gae)
+
+    return torch.stack(advantages)
+
+
+class ActorCritic(nn.Module):
+    """Shared-backbone Actor-Critic network."""
+
+    def __init__(self, obs_dim, action_dim, hidden_dim):
+        super().__init__()
+        self.actor = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x):
+        return self.actor(x)
+
+    def get_value(self, x):
+        return self.critic(x).squeeze(-1)
+
+    def get_action(self, x):
+        logits = self.actor(x)
+        probs = torch.softmax(logits, dim=-1)
+        dist = torch.distributions.Categorical(probs)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        return action, log_prob, probs
+
+
+class SimplePPO:
+    """Independent PPO: one ActorCritic network per agent."""
+
+    def __init__(
+        self,
+        num_agents,
+        obs_dim,
+        action_dim,
+        hidden_dim,
+        lr,
+        device,
+        entropy_coeff=0.01,
+        value_coeff=0.5,
+        max_grad_norm=0.5,
+    ):
+        self.device = device
+        self.entropy_coeff = entropy_coeff
+        self.value_coeff = value_coeff
+        self.max_grad_norm = max_grad_norm
+        self.networks = {}
+
+        for index in range(num_agents):
+            agent = f"agent_{index}"
+            self.networks[agent] = ActorCritic(obs_dim, action_dim, hidden_dim).to(device)
+
+        self.optimizers = {
+            agent: torch.optim.Adam(net.parameters(), lr=lr)
+            for agent, net in self.networks.items()
         }
-        
-        for _ in range(num_episodes):
-            obs, _ = self.env.reset()
-            
-            for step in range(self.episode_length):
-                # Select actions using greedy policy
-                actions = []
-                with torch.no_grad():
-                    for agent in self.agents:
-                        state_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
-                        action_probs, _ = agent.network(state_tensor)
-                        action = torch.argmax(action_probs, dim=-1).item()
-                        actions.append(action)
-                
-                # Environment step
-                next_obs, _, terminated, _, _ = self.env.step(actions[0])
-                obs = next_obs
-                
-                if terminated:
-                    break
-            
-            # Collect metrics
-            metrics = self.env.get_metrics()
-            for key, value in metrics.items():
-                if key in all_metrics:
-                    all_metrics[key].append(value)
-        
-        # Average metrics
-        avg_metrics = {key: np.mean(values) for key, values in all_metrics.items()}
-        return avg_metrics
-    
-    def train(self):
-        """Run training loop."""
-        print("=" * 80)
-        print(f"IPPO Training - Experiment: {self.experiment_name}")
-        print("=" * 80)
-        print(f"Total Episodes: {self.total_episodes}")
-        print(f"Episode Length: {self.episode_length}")
-        print(f"Number of Agents: {self.num_agents}")
-        print(f"Device: {self.device}")
-        print("=" * 80)
-        
-        self.episode_count = 0
-        best_eval_reward = float('-inf')
-        
-        # Training loop
-        pbar = tqdm(total=self.total_episodes, desc="Training")
-        
-        for episode in range(self.total_episodes):
-            self.episode_count = episode
-            
-            # Train one episode
-            avg_reward = self.train_episode()
-            
-            # Log training metrics
-            self.writer.add_scalar('training/episode_reward', avg_reward, episode)
-            
-            # Periodic evaluation and checkpoint
-            if (episode + 1) % self.save_interval == 0:
-                eval_metrics = self.evaluate(num_episodes=10)
-                
-                # Log evaluation metrics
-                for key, value in eval_metrics.items():
-                    self.writer.add_scalar(f'evaluation/{key}', value, episode)
-                
-                # Save checkpoint
-                self.save_checkpoint(episode)
-                
-                # Print progress
-                print(f"\nEpisode {episode + 1}/{self.total_episodes}")
-                print(f"  Avg Training Reward: {avg_reward:.4f}")
-                print(f"  Task Completion Rate: {eval_metrics['task_completion_rate']:.4f}")
-                print(f"  Energy Consumption: {eval_metrics['energy_consumption']:.4f}")
-                print(f"  Average Delay: {eval_metrics['average_delay']:.4f}")
-                print(f"  Fairness Index: {eval_metrics['fairness_index']:.4f}")
-            
-            pbar.update(1)
-        
-        pbar.close()
-        
-        # Final evaluation
-        print("\n" + "=" * 80)
-        print("Final Evaluation")
-        print("=" * 80)
-        final_metrics = self.evaluate(num_episodes=100)
-        for key, value in final_metrics.items():
-            print(f"  {key}: {value:.4f}")
-        
-        # Save final model and results
-        self.save_checkpoint(self.total_episodes - 1, is_final=True)
-        self.save_results(final_metrics)
-        
-        self.writer.close()
-    
-    def save_checkpoint(self, episode: int, is_final: bool = False):
-        """Save model checkpoint."""
-        checkpoint_path = self.checkpoint_dir / f"episode_{episode:06d}.pt"
-        
-        state_dict = {
-            'episode': episode,
-            'agents': [agent.network.state_dict() for agent in self.agents],
-            'config': self.config
+
+    def select_action(self, agent, state):
+        with torch.no_grad():
+            action, log_prob, probs = self.networks[agent].get_action(
+                state.unsqueeze(0)
+            )
+            value = self.networks[agent].get_value(state.unsqueeze(0)).item()
+            return action.item(), log_prob.item(), value
+
+    def update(self, agent, states, actions, old_log_probs, advantages, clip_ratio=0.2):
+        actions_tensor = actions
+        if actions_tensor.dim() == 0:
+            actions_tensor = actions_tensor.unsqueeze(0)
+
+        action, new_log_probs, probs = self.networks[agent].get_action(states)
+        values = self.networks[agent].get_value(states)
+
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
+
+        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1).mean()
+        entropy_loss = -self.entropy_coeff * entropy
+
+        value_loss = self.value_coeff * nn.functional.mse_loss(values, values.detach())
+
+        total_loss = policy_loss + entropy_loss + value_loss
+
+        self.optimizers[agent].zero_grad()
+        total_loss.backward()
+        nn.utils.clip_grad_norm_(self.networks[agent].parameters(), self.max_grad_norm)
+        self.optimizers[agent].step()
+
+        return {
+            "policy_loss": policy_loss.item(),
+            "entropy": entropy.item(),
+            "value_loss": value_loss.item(),
+            "total_loss": total_loss.item(),
         }
-        
-        torch.save(state_dict, checkpoint_path)
-        
-        if is_final:
-            torch.save(state_dict, self.checkpoint_dir / "final_model.pt")
-    
-    def save_results(self, metrics: dict):
-        """Save final results to file."""
-        results_file = self.experiment_dir / "results.json"
-        with open(results_file, 'w') as f:
-            json.dump(metrics, f, indent=4)
-        
-        # Also save as text
-        results_txt = self.experiment_dir / "results.txt"
-        with open(results_txt, 'w') as f:
-            f.write("=" * 80 + "\n")
-            f.write(f"IPPO Baseline Results - {self.experiment_name}\n")
-            f.write("=" * 80 + "\n\n")
-            for key, value in metrics.items():
-                f.write(f"{key}: {value:.6f}\n")
 
 
 def main():
-    """Main training function."""
-    parser = argparse.ArgumentParser(description="IPPO Training for Edge Offloading")
-    parser.add_argument('--config', type=str, default='configs/default_config.yaml',
-                        help='Path to configuration file')
-    parser.add_argument('--name', type=str, default=None,
-                        help='Experiment name')
-    parser.add_argument('--episodes', type=int, default=None,
-                        help='Number of training episodes')
-    
+    parser = argparse.ArgumentParser(description="PettingZoo PPO Training")
+    parser.add_argument("--config", type=str, default="configs/default_config.yaml")
+    parser.add_argument("--episodes", type=int, default=500)
+    parser.add_argument("--name", type=str, default=None)
+    parser.add_argument(
+        "--device", type=str, default="auto", choices=["auto", "cpu", "cuda"]
+    )
     args = parser.parse_args()
-    
-    # Load configuration
+
     config = load_config(args.config)
-    
-    # Override config with command line arguments
-    if args.episodes:
-        config['marl']['total_episodes'] = args.episodes
-    
-    # Create and run trainer
-    trainer = IPPOTrainer(config, experiment_name=args.name)
-    trainer.train()
+    config["marl"]["total_episodes"] = args.episodes
+
+    set_seed(config.get("seed", 42))
+    device = get_device(args.device)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_name = args.name or f"IPPO_{timestamp}"
+    exp_dir = Path("results") / exp_name
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    (exp_dir / "checkpoints").mkdir(exist_ok=True)
+
+    print("=" * 80)
+    print(f"IPPO TRAINING - {exp_name}")
+    print("=" * 80)
+
+    env = EdgeOffloadingEnv(config)
+    num_agents = env.num_agents
+    obs_dim = config["environment"]["state_dim"]
+    action_dim = env.action_spaces["agent_0"].n
+    hidden_dim = _get_config_value(
+        config, ("marl", "hidden_dim"), ("algorithm", "hidden_dim")
+    )
+    lr = config["algorithm"]["learning_rate"]
+    episode_length = _get_config_value(
+        config, ("marl", "episode_length"), ("algorithm", "episode_length")
+    )
+
+    print(f"Agents: {num_agents}")
+    print(f"Obs dim: {obs_dim}, Action dim: {action_dim}")
+    print(f"Episodes: {args.episodes}, Steps per episode: {episode_length}")
+    print(f"✓ Device: {device}")
+    print()
+
+    ppo = SimplePPO(
+        num_agents,
+        obs_dim,
+        action_dim,
+        hidden_dim,
+        lr,
+        device,
+        entropy_coeff=config["algorithm"].get("entropy_coeff", 0.01),
+        value_coeff=config["algorithm"].get("value_coeff", 0.5),
+        max_grad_norm=config["algorithm"].get("max_grad_norm", 0.5),
+    )
+    writer = SummaryWriter(str(exp_dir / "logs"))
+
+    with open(exp_dir / "config.yaml", "w", encoding="utf-8") as file:
+        yaml.safe_dump(config, file, allow_unicode=True)
+
+    episode_rewards = []
+    completion_rates = []
+
+    for episode in tqdm(range(args.episodes), desc="Episodes"):
+        observations, _ = env.reset()
+        observations = {
+            agent: torch.from_numpy(obs).float().to(device)
+            for agent, obs in observations.items()
+        }
+
+        trajectories = {
+            agent: {
+                "states": [],
+                "actions": [],
+                "rewards": [],
+                "values": [],
+                "log_probs": [],
+            }
+            for agent in env.agents
+        }
+
+        episode_reward = 0.0
+
+        for _ in range(episode_length):
+            actions = {}
+            for agent in env.agents:
+                action, log_prob, value = ppo.select_action(agent, observations[agent])
+                actions[agent] = action
+                trajectories[agent]["states"].append(observations[agent])
+                trajectories[agent]["actions"].append(action)
+                trajectories[agent]["log_probs"].append(log_prob)
+                trajectories[agent]["values"].append(value)
+
+            next_obs, rewards, terminations, truncations, _ = env.step(actions)
+            next_obs = {
+                agent: torch.from_numpy(obs).float().to(device)
+                for agent, obs in next_obs.items()
+            }
+
+            for agent in env.agents:
+                trajectories[agent]["rewards"].append(rewards[agent])
+                episode_reward += rewards[agent]
+
+            observations = next_obs
+            if all(terminations.values()) or all(truncations.values()):
+                break
+
+        episode_rewards.append(episode_reward)
+        metrics = env.get_metrics()
+        completion_rates.append(metrics["task_completion_rate"])
+
+        for agent in env.agents:
+            if len(trajectories[agent]["states"]) < 2:
+                continue
+
+            states = torch.stack(trajectories[agent]["states"])
+            actions_t = torch.tensor(
+                trajectories[agent]["actions"], dtype=torch.long, device=device
+            )
+            old_log_probs = torch.tensor(
+                trajectories[agent]["log_probs"], dtype=torch.float32, device=device
+            )
+            rewards_tensor = torch.tensor(
+                trajectories[agent]["rewards"], dtype=torch.float32, device=device
+            )
+            values_tensor = torch.tensor(
+                trajectories[agent]["values"], dtype=torch.float32, device=device
+            )
+
+            with torch.no_grad():
+                final_value = ppo.select_action(agent, observations[agent])[2]
+                values_tensor = torch.cat(
+                    [values_tensor, torch.tensor([final_value], device=device)]
+                )
+
+            advantages = compute_gae(rewards_tensor, values_tensor, device=device)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            ppo.update(agent, states, actions_t, old_log_probs, advantages)
+
+        if episode % 10 == 0:
+            writer.add_scalar("train/episode_reward", episode_reward, episode)
+            writer.add_scalar(
+                "train/completion_rate", metrics["task_completion_rate"], episode
+            )
+
+    print("\n" + "=" * 80)
+    print("TRAINING COMPLETE!")
+    print("=" * 80)
+    print(f"Final 10-ep avg reward:     {np.mean(episode_rewards[-10:]):.4f}")
+    print(f"Final 10-ep avg completion: {np.mean(completion_rates[-10:]):.4f}")
+
+    results = {
+        "final_completion_rate": float(np.mean(completion_rates[-10:])),
+        "final_avg_reward": float(np.mean(episode_rewards[-10:])),
+        "episode_rewards": [float(r) for r in episode_rewards],
+        "completion_rates": [float(r) for r in completion_rates],
+    }
+
+    with open(exp_dir / "results.json", "w", encoding="utf-8") as file:
+        json.dump(results, file, indent=2)
+
+    torch.save(
+        {"networks": {agent: net.state_dict() for agent, net in ppo.networks.items()}},
+        exp_dir / "checkpoints" / "final_model.pt",
+    )
+
+    writer.close()
+    print(f"\n✓ Results saved to: {exp_dir}")
+    return results
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

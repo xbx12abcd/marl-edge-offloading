@@ -2,584 +2,372 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.13+-red.svg)](https://pytorch.org/)
+[![PettingZoo](https://img.shields.io/badge/PettingZoo-1.25+-orange.svg)](https://pettingzoo.farama.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-12.1+-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## 📋 项目概述
+## 项目概述
 
-本项目通过多智能体强化学习（MARL）解决边缘计算中的任务卸载和调度问题。项目采用分阶段实施策略，逐步构建从基础仿真到高级通信机制的完整解决方案。
+本项目通过多智能体强化学习（MARL）解决边缘计算中的**任务卸载与调度**问题。每个端设备作为独立智能体，自主决定将计算任务在本地执行还是卸载至某台边缘服务器，目标是在**任务完成率、能量消耗、传输延迟和资源公平性**之间取得最优平衡。
 
-### 🎯 核心问题
-- **可扩展性挑战**: 多设备、多任务的复杂调度问题
-- **通信约束**: 智能体间协作的隐式通信限制
-- **资源优化**: 能量消耗、延迟和公平性的多目标优化
-- **可解释性**: 决策过程的透明度和可理解性
+### 核心问题
 
-### 🏗️ 架构设计
+- **可扩展性**：支持 50+ 设备、多服务器的大规模调度
+- **通信约束**：智能体间协作的隐式/显式通信限制
+- **多目标优化**：能量、延迟、公平性的联合优化
+- **可解释性**：决策过程透明可分析
+
+### 系统架构
+
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   End Devices   │    │  Edge Servers   │    │   Cloud Layer   │
-│   (Smartphones, │    │   (Edge Nodes)  │    │  (Data Center)  │
-│    IoT Devices) │    │                 │    │                 │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 │
-                    ┌─────────────────────┐
-                    │   MARL Controller   │
-                    │                     │
-                    │  ┌────────────────┐ │
-                    │  │     IPPO       │ │
-                    │  │  (Baseline)    │ │
-                    │  └────────────────┘ │
-                    │                     │
-                    │  ┌────────────────┐ │
-                    │  │   Explaboff    │ │
-                    │  │ (Communication)│ │
-                    │  └────────────────┘ │
-                    └─────────────────────┘
+┌────────────────────┐    ┌────────────────────┐    ┌────────────────────┐
+│   End Devices      │    │   Edge Servers     │    │   Cloud Layer      │
+│  (agent_0..N-1)    │───▶│  (server_0..M-1)   │───▶│  (Data Center)     │
+└────────────────────┘    └────────────────────┘    └────────────────────┘
+         │                          │
+         └──────── MARL Controller ─┘
+                  ┌──────────────┐
+                  │  IPPO        │  Stage 1: 独立PPO基线
+                  │  Explaboff   │  Stage 2: 互信息通信
+                  │  GNN-PPO     │  Stage 3: 图神经网络（当前）
+                  └──────────────┘
 ```
 
-## 📊 项目状态
+---
 
-| 阶段 | 功能描述 | 权重 | 状态 | 进度 |
-|------|----------|------|------|------|
+## 项目状态
+
+| 阶段 | 内容 | 权重 | 状态 | 进度 |
+|------|------|------|------|------|
 | **1** | 仿真环境 + IPPO基线 | 30% | ✅ 完成 | 100% |
-| **2** | Explaboff (互信息通信) | 35% | ✅ 完成 | 100% |
-| **3** | 大规模场景优化 | 35% | 🔄 进行中 | 70% |
-| **4** | GUI可视化演示 | +10% | 📅 计划中 | 0% |
+| **2** | Explaboff 互信息通信 | 35% | ✅ 完成 | 100% |
+| **3** | GNN 大规模场景优化 | 35% | 🔄 进行中 | 75% |
+| **4** | GUI 可视化演示 | +10% | 📅 计划中 | 0% |
 
-### ✅ 已完成的核心功能
+**整体进度：约 82%**（最后更新：2026-04-21）
 
-#### 阶段1: 基础框架 (100%完成)
-- 🏭 **边缘计算仿真环境**: 多设备网络、动态任务生成、资源约束管理
-- 🤖 **IPPO算法**: 独立PPO基线实现，Actor-Critic架构
-- 📊 **评估指标**: 任务完成率、能量效率、延迟、公平性
-- 🛠️ **工具链**: 配置管理、日志记录、TensorBoard集成
+---
 
-#### 阶段2: 通信机制 (100%完成)
-- 📡 **互信息估计器**: 基于NCE的智能体间信息量度量
-- 🔄 **注意力通信**: 多头注意力机制的选择性通信
-- 🎯 **Explaboff智能体**: 通信增强的PPO变体
+## 环境要求
 
-#### 阶段3: 规模优化 (70%完成)
-- 🚀 **GPU显存优化**: RTX 4060 Ti专项优化，显存占用降低75%
-- ⚡ **混合精度训练**: FP16 + FP32，性能提升50%
-- 📈 **自动批次调整**: OOM自动恢复机制
-- 🔍 **完整监控工具**: 实时显存、性能诊断
+| 组件 | 版本要求 |
+|------|---------|
+| Python | 3.10+ |
+| PyTorch | 1.13+ |
+| PettingZoo | 1.25+ |
+| CUDA | 12.1+（推荐） |
+| GPU 显存 | 8GB+（RTX 4060 Ti 已验证） |
+| 内存 | 16GB+ RAM |
 
-## 🚀 快速开始
+---
 
-### 环境要求
-- **Python**: 3.10+
-- **GPU**: NVIDIA RTX 4060 Ti (推荐) 或其他CUDA GPU
-- **CUDA**: 12.1+
-- **内存**: 16GB+ RAM
+## 快速开始
 
-### 安装步骤
+### 1. 安装依赖
 
-#### 1. 克隆项目
 ```bash
-git clone https://github.com/your-username/marl-edge-offloading.git
-cd marl-edge-offloading
-```
-
-#### 2. 创建Conda环境
-```bash
-# 创建环境
 conda create -n marl-edge python=3.10 -y
-
-# 激活环境
 conda activate marl-edge
-
-# 安装依赖
 pip install -r requirements.txt
 ```
 
-#### 3. 验证安装
+### 2. 验证环境
+
 ```bash
-python -c "import torch; import gymnasium; print('✅ 环境配置成功!')"
-python -c "print(f'CUDA可用: {torch.cuda.is_available()}')"
+python -c "import torch, pettingzoo, gymnasium; print('OK')"
+python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
 ```
 
-### 🎮 快速测试
+### 3. 快速训练测试（5分钟）
 
-#### 环境验证
 ```bash
-# 测试仿真环境
-python test_env.py
-```
-
-#### 快速训练 (调试用)
-```bash
-# 50个episode的快速训练
 python quick_start.py --episodes 50 --length 50
 ```
 
-#### 完整训练
+---
+
+## 训练脚本
+
+### `train_ippo.py` — Stage 1 & 2 标准训练
+
+基于 PettingZoo 并行 API，为每个智能体独立训练 PPO 策略（Independent PPO）。
+
 ```bash
-# 使用默认配置训练
-python train_ippo_lowmem.py --episodes 500
+# 默认配置训练（10 智能体，500 episodes）
+python train_ippo.py --episodes 500
 
-# 使用自定义配置
-python train_ippo_lowmem.py --config configs/lowmem_config.yaml --episodes 1000
+# 指定配置和设备
+python train_ippo.py --config configs/default_config.yaml --episodes 1000 --device cuda
+
+# 低显存机器
+python train_ippo.py --config configs/lowmem_config.yaml --episodes 500 --device cpu
+
+# 自定义实验名称（结果保存到 results/my_exp/）
+python train_ippo.py --episodes 500 --name my_exp
 ```
 
-#### 模型评估
+### `train_scalable.py` — Stage 3 大规模 GNN 训练
+
+参数共享 + 图注意力网络（GAT），支持 50+ 智能体。
+
 ```bash
-# 评估训练好的模型
-python evaluate_checkpoint.py results/<experiment_name>/checkpoints/final_model.pt --episodes 10
+# 20 智能体（测试用）
+python train_scalable.py --num_agents 20 --episodes 500
 
-# 运行推演演示
-python evaluate_checkpoint.py results/<experiment_name>/checkpoints/final_model.pt --demo --steps 100
+# 50 智能体大规模场景（目标配置）
+python train_scalable.py --num_agents 50 --episodes 1000 --device cuda
+
+# 自定义实验名
+python train_scalable.py --num_agents 50 --episodes 1000 --name GNN_50agents
 ```
 
-## 📁 项目结构
+### `train_explaboff.py` — Stage 2 Explaboff 训练
 
-```
-marl-edge-offloading/
-├── 📂 agents/                    # 智能体算法实现
-│   ├── ppo_agent.py             # IPPO智能体
-│   ├── explaboff_agent.py       # Explaboff智能体
-│   └── networks.py              # 神经网络架构
-├── 📂 envs/                     # 仿真环境
-│   └── edge_env.py              # 边缘计算环境
-├── 📂 configs/                  # 配置文件
-│   ├── default_config.yaml      # 默认配置
-│   ├── lowmem_config.yaml       # 低显存优化配置
-│   └── explaboff_config.yaml    # Explaboff配置
-├── 📂 utils/                    # 工具库
-│   ├── gpu_monitor.py           # GPU监控和优化
-│   ├── helpers.py               # 辅助函数
-│   └── __init__.py
-├── 📂 results/                  # 实验结果
-│   └── <experiment_name>/       # 实验目录
-│       ├── checkpoints/         # 模型检查点
-│       ├── logs/                # TensorBoard日志
-│       ├── config.yaml          # 实验配置
-│       └── results.json         # 评估结果
-├── 📂 tools/                    # 分析工具
-├── 📂 notebooks/                # Jupyter笔记本
-├── 📂 gui/                      # 可视化界面 (规划中)
-├── 🔧 train_ippo_lowmem.py      # 低显存训练脚本
-├── 🔧 evaluate_checkpoint.py    # 模型评估脚本
-├── 🔧 evaluate_compare.py       # 算法对比脚本
-├── 🔧 quick_start.py            # 快速启动脚本
-├── 📋 requirements.txt          # Python依赖
-└── 📖 README.md                 # 项目文档
-```
-
-## 📊 实验结果
-
-### 性能指标
-
-| 配置 | 任务完成率 | 能量效率 | 平均延迟 | 公平性指数 |
-|------|-----------|----------|----------|-----------|
-| IPPO (基线) | 65-75% | 中等 | 15-25ms | 0.65-0.75 |
-| Explaboff | 75-85% | 良好 | 12-20ms | 0.75-0.85 |
-| 大规模优化 | 70-80% | 优秀 | 10-18ms | 0.70-0.80 |
-
-### GPU优化效果
-
-| 指标 | 优化前 | 优化后 | 改进 |
-|------|--------|--------|------|
-| 显存占用 | 8GB+ | 2-3GB | ↓75% |
-| 训练稳定性 | 不稳定 | 稳定 | ✅ |
-| 批次大小 | 64 | 8+累积 | 等效增大 |
-| 混合精度 | FP32 | FP16+FP32 | ↑50%速度 |
-
-## 🔧 使用指南
-
-### 配置文件说明
-
-#### 环境参数 (`configs/lowmem_config.yaml`)
-```yaml
-environment:
-  num_edge_servers: 2          # 边缘服务器数量
-  num_end_devices: 5           # 端设备数量
-  num_tasks: 10                # 同时任务数量
-  state_dim: 32                # 状态空间维度
-
-algorithm:
-  hidden_dim: 32               # 网络隐藏层维度
-  batch_size: 8                # 训练批次大小
-  learning_rate: 0.001         # 学习率
-  use_mixed_precision: true    # 启用混合精度
-
-marl:
-  num_agents: 3                # 智能体数量
-  total_episodes: 500          # 总训练轮数
-```
-
-### 自定义训练
-
-#### 基本训练
 ```bash
-python train_ippo_lowmem.py \
-  --episodes 1000 \
-  --config configs/lowmem_config.yaml \
-  --name my_experiment
+python train_explaboff.py --config configs/explaboff_config.yaml
 ```
 
-#### 高级配置
+---
+
+## 评估脚本
+
+### `evaluate_checkpoint.py` — 单模型评估 / 推演演示
+
+加载已训练的 `.pt` 检查点文件，在环境中运行若干 episode 并输出性能指标。
+
+**评估模式**（统计多 episode 平均指标）：
 ```bash
-# 启用详细日志
-python train_ippo_lowmem.py --verbose
+# 基本用法：评估 final_model.pt，跑 10 个 episode
+python evaluate_checkpoint.py results/IPPO_20260421_120000/checkpoints/final_model.pt
 
-# 指定GPU设备
-export CUDA_VISIBLE_DEVICES=0
-python train_ippo_lowmem.py --device cuda:0
+# 指定 episode 数量
+python evaluate_checkpoint.py results/<exp>/checkpoints/final_model.pt --episodes 20
 
-# 自定义实验名称
-python train_ippo_lowmem.py --name "experiment_$(date +%Y%m%d_%H%M%S)"
+# 指定配置文件（默认自动从实验目录查找）
+python evaluate_checkpoint.py results/<exp>/checkpoints/final_model.pt --config configs/default_config.yaml
+
+# 同时显示每步的动作和奖励
+python evaluate_checkpoint.py results/<exp>/checkpoints/final_model.pt --render
 ```
 
-### 结果分析
-
-#### TensorBoard可视化
+**演示模式**（逐步打印每个时步的决策细节）：
 ```bash
-# 启动TensorBoard
+# 逐步演示 50 步，每步间隔 0.5 秒
+python evaluate_checkpoint.py results/<exp>/checkpoints/final_model.pt --demo --steps 50
+
+# 加快演示速度
+python evaluate_checkpoint.py results/<exp>/checkpoints/final_model.pt --demo --steps 100 --delay 0.1
+```
+
+输出结果保存到：`results/<exp>/evaluation/<checkpoint_name>_evaluation.json`
+
+---
+
+### `evaluate_compare.py` — IPPO vs Explaboff 算法对比
+
+从零训练或加载已有检查点，横向对比两种算法的性能，生成对比图表。
+
+```bash
+# 从随机初始化训练后对比（各训练 200 episode，评估 30 episode）
+python evaluate_compare.py --train 200 --eval 30
+
+# 使用已训练的检查点（跳过训练，直接评估对比）
+python evaluate_compare.py \
+  --ippo_ckpt results/IPPO_xxx/checkpoints/final_model.pt \
+  --explaboff_ckpt results/Explaboff_xxx/checkpoints/final_model.pt \
+  --eval 30
+
+# 也可只为其中一个算法提供检查点
+python evaluate_compare.py \
+  --ippo_ckpt results/IPPO_xxx/checkpoints/final_model.pt \
+  --train 200 --eval 30
+```
+
+输出到 `results/comparison/`：
+- `comparison_results.json`：数字结果
+- `comparison_plots.png`：8 项指标的对比折线图（含训练曲线 + 互信息）
+
+---
+
+## 两个评估脚本的核心区别
+
+| 维度 | `evaluate_checkpoint.py` | `evaluate_compare.py` |
+|------|--------------------------|----------------------|
+| **用途** | 评估一个已训练好的模型 | 横向对比两种算法 |
+| **输入** | 需要 `.pt` 检查点文件 | 可选检查点，无则从随机初始化训练 |
+| **算法** | 单一算法（IPPO / GNN） | IPPO + Explaboff 同时运行 |
+| **输出** | 该模型的绝对性能指标 | 两算法的相对提升百分比 + 对比图 |
+| **MI 奖励** | 不适用 | ExplaboffAgent 每步融入 MI 奖励信号 |
+| **典型场景** | 训练完成后验证模型效果 | 阶段2汇报：展示通信机制的增益 |
+
+---
+
+## 项目结构
+
+```
+Communication_Network_project/
+│
+├── train_ippo.py              # Stage 1/2 标准训练（PettingZoo + SimplePPO）
+├── train_scalable.py          # Stage 3 大规模 GNN 训练
+├── train_explaboff.py         # Stage 2 Explaboff 训练
+├── quick_start.py             # 快速调试训练
+├── evaluate_checkpoint.py     # 单模型评估 / 逐步演示
+├── evaluate_compare.py        # IPPO vs Explaboff 对比
+├── test_env.py                # 环境基础功能测试
+│
+├── envs/
+│   ├── __init__.py            # 导出 EdgeOffloadingEnv, EdgeComputingEnv
+│   └── edge_env.py            # PettingZoo 并行环境（主）+ 单智能体包装器（兼容）
+│
+├── agents/
+│   ├── ppo_agent.py           # Stage 1 IPPO 智能体
+│   ├── explaboff_agent.py     # Stage 2 Explaboff 智能体（互信息通信）
+│   ├── networks.py            # 网络架构基类
+│   └── gnn_agent.py           # Stage 3 GNN 智能体（图注意力 + 参数共享）
+│
+├── utils/
+│   ├── helpers.py             # 配置加载、指标收集、工具函数
+│   ├── task_device.py         # Task / Device 数据类
+│   └── gpu_monitor.py         # GPU 显存监控与诊断
+│
+├── configs/
+│   ├── default_config.yaml    # 标准配置（10 智能体，64维状态）
+│   ├── lowmem_config.yaml     # 低显存配置（RTX 4060 Ti 8GB）
+│   └── explaboff_config.yaml  # Stage 2 Explaboff 配置
+│
+├── results/                   # 训练输出（运行后自动生成）
+│   ├── IPPO_<timestamp>/
+│   │   ├── config.yaml
+│   │   ├── results.json
+│   │   ├── checkpoints/
+│   │   │   ├── episode_000499.pt
+│   │   │   └── final_model.pt
+│   │   ├── logs/              # TensorBoard 日志
+│   │   └── evaluation/        # evaluate_checkpoint.py 输出
+│   ├── GNN_n50_<timestamp>/   # Stage 3 输出
+│   └── comparison/            # evaluate_compare.py 输出
+│
+└── gui/                       # Stage 4（待实现）
+```
+
+---
+
+## 关键概念
+
+### 动作空间
+| 动作值 | 含义 |
+|--------|------|
+| `0` | 本地执行（在端设备上运行） |
+| `1` | 卸载至边缘服务器 1 |
+| `2` | 卸载至边缘服务器 2 |
+| `...` | ... |
+| `n` | 卸载至边缘服务器 n |
+
+### 奖励函数
+```
+成功完成（deadline 内）：
+  reward = completion_weight(0.4)
+         - energy_penalty(0.1) × energy_consumed
+         - deadline_penalty(0.2) × total_delay
+         + fairness_bonus(0.1) × (1 - std(server_loads))  # 仅卸载时
+
+超时失败：
+  reward = -10.0
+```
+
+### 观测空间（64维向量）
+| 维度 | 内容 |
+|------|------|
+| 0 | 当前任务 CPU 需求（归一化） |
+| 1 | 当前任务数据大小（归一化） |
+| 2 | 当前任务 deadline（归一化） |
+| 3 | 任务等待时间（归一化） |
+| 4 | 本地队列长度（归一化） |
+| 5~9 | 各边缘服务器当前负载（归一化） |
+| -2 | Episode 进度（当前步/总步数） |
+| -1 | 剩余未完成任务比例 |
+
+---
+
+## 性能基准
+
+| 算法 | 智能体数 | 完成率 | 能量(J) | 平均延迟 | 公平性 |
+|------|---------|--------|---------|---------|--------|
+| IPPO（基线） | 10 | 65–75% | ~6200 | 12.5 | 0.72 |
+| Explaboff | 10 | 75–82% | ~5300 | 11.8 | 0.76 |
+| GNN-PPO（目标） | 50 | >80% | 更低 | 更短 | >0.85 |
+
+### GPU 显存参考
+
+| 配置文件 | 智能体数 | 显存占用 |
+|---------|---------|---------|
+| `lowmem_config.yaml` | 3–5 | ~1–2 GB |
+| `default_config.yaml` | 10 | ~3–4 GB |
+| `train_scalable` N=50 | 50 | ~5–7 GB |
+
+---
+
+## 查看训练曲线
+
+```bash
+# 启动 TensorBoard
 tensorboard --logdir results/
 
 # 浏览器访问 http://localhost:6006
 ```
 
-#### 结果文件结构
-```
-results/<experiment_name>/
-├── config.yaml              # 实验配置备份
-├── results.json             # 最终评估指标
-├── results.txt              # 格式化的结果报告
-├── checkpoints/             # 模型检查点
-│   ├── episode_000499.pt    # 中间检查点
-│   └── final_model.pt       # 最终模型
-└── logs/                    # TensorBoard日志
-    └── events.out.tbx
-```
-
-## 🔬 研究方向
-
-### 短期目标 (1-2个月)
-- [ ] **超参数调优**: 网格搜索最优配置
-- [ ] **算法对比**: IPPO vs Explaboff vs MADDPG
-- [ ] **可扩展性测试**: 10-20个智能体的性能
-- [ ] **消融实验**: 分析各组件贡献
-
-### 中期目标 (3-6个月)
-- [ ] **多目标优化**: 帕累托最优解集
-- [ ] **动态环境**: 时变网络条件适应
-- [ ] **异构设备**: 不同计算能力的智能体
-- [ ] **安全约束**: 隐私保护和鲁棒性
-
-### 长期目标 (6个月+)
-- [ ] **实时部署**: 边缘设备实际部署
-- [ ] **多模态学习**: 结合视觉/文本信息
-- [ ] **元学习**: 快速适应新环境
-- [ ] **人机协作**: 人类专家指导的训练
-
-## 🤝 贡献指南
-
-### 开发环境设置
-```bash
-# 1. Fork项目
-# 2. 创建特性分支
-git checkout -b feature/your-feature-name
-
-# 3. 安装开发依赖
-pip install -r requirements-dev.txt
-
-# 4. 运行测试
-python -m pytest tests/
-
-# 5. 提交更改
-git commit -m "Add: your feature description"
-git push origin feature/your-feature-name
-```
-
-### 代码规范
-- **Python**: 遵循PEP 8风格指南
-- **文档**: 所有函数和类需要docstring
-- **测试**: 新功能需要对应的单元测试
-- **类型提示**: 使用类型注解
-
-### 提交规范
-```
-类型: 简短描述
-
-详细说明...
-
-相关问题: #123
-```
-
-类型包括: `Add`, `Fix`, `Update`, `Remove`, `Refactor`
-
-## 📚 相关文档
-
-### 📖 详细文档
-- [GPU优化指南](GPU_OPTIMIZATION_GUIDE.md) - RTX 4060 Ti专项优化
-- [项目阶段指南](PROJECT_STAGES.md) - 分阶段实施计划
-- [快速参考](QUICK_REFERENCE.md) - 常用命令和配置
-- [完成报告](COMPLETION_REPORT.md) - 项目进度总结
-
-### 🛠️ 工具文档
-- [显存监控工具](utils/gpu_monitor.py) - GPU内存管理
-- [环境仿真](envs/edge_env.py) - 边缘计算建模
-- [智能体算法](agents/) - MARL算法实现
-
-## 📄 许可证
-
-本项目采用MIT许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
-
-## 👥 作者与致谢
-
-- **主要开发者**: [您的名字]
-- **指导教师**: [导师姓名]
-- **同门贡献者**: [贡献者列表]
-
-特别感谢NVIDIA提供GPU优化支持，以及PyTorch团队的优秀框架。
-
-## 📞 联系方式
-
-- **项目主页**: [GitHub Repository]
-- **问题反馈**: [Issues](https://github.com/your-username/marl-edge-offloading/issues)
-- **邮箱**: your.email@example.com
+可查看：每个 episode 的奖励曲线、任务完成率、公平性指数、各项损失（policy/value/entropy）。
 
 ---
 
-⭐ 如果这个项目对你有帮助，请给它一个star！
-
-```
-Communication_Network_project/
-├── configs/                 # 配置文件
-│   ├── default_config.yaml  # 默认配置
-│   └── explaboff_config.yaml # Explaboff方案配置
-├── envs/                    # 仿真环境
-│   ├── __init__.py
-│   └── edge_env.py          # 边缘计算环境
-├── agents/                  # 智能体实现
-│   ├── __init__.py
-│   ├── networks.py          # 神经网络架构
-│   └── ppo_agent.py         # PPO智能体
-├── algorithms/              # 算法实现
-├── utils/                   # 工具函数
-│   ├── __init__.py
-│   ├── helpers.py           # 辅助函数
-│   └── task_device.py       # 任务和设备类
-├── data/                    # 数据存储
-├── results/                 # 训练结果
-├── gui/                     # GUI相关代码
-├── notebooks/               # Jupyter笔记本
-├── train_ippo.py            # IPPO训练脚本
-├── test_env.py              # 环境测试脚本
-├── quick_start.py           # 快速启动脚本
-└── requirements.txt         # 项目依赖
-```
-
-## 运行指南
-
-### 🎯 GPU优化版本（强烈推荐RTX 4060 Ti用户）
-
-如果使用NVIDIA RTX 4060 Ti或其他8GB显存的GPU，请使用优化版本：
-
-```bash
-# 第1步：诊断硬件
-python diagnose_gpu.py
-
-# 第2步：快速测试（5分钟）
-python train_ippo_lowmem.py --episodes 10
-
-# 第3步：完整训练（2-3小时）
-python train_ippo_lowmem.py --episodes 500
-```
-
-**为什么使用优化版本？**
-- ✅ 显存占用 75% 降低（8GB → 2-3GB）
-- ✅ 自动FP16混合精度
-- ✅ 梯度累积实现
-- ✅ OOM异常自动恢复
-- ✅ 实时显存监控
-
-**相关文档：**
-- 📖 [GPU优化完整指南](GPU_OPTIMIZATION_GUIDE.md) - 详细的优化技术
-- ⚡ [GPU快速参考卡](GPU_QUICK_REFERENCE.md) - 一页纸速查表
-- 📊 [GPU优化报告](GPU_OPTIMIZATION_REPORT.md) - 优化完成总结
-
-**配置文件：**
-- 📝 [lowmem_config.yaml](configs/lowmem_config.yaml) - RTX 4060 Ti推荐配置
-
-### 1. 测试环境和智能体
-
-```bash
-# 运行环境和智能体的基础测试
-python test_env.py
-```
-
-输出应该显示：
-- ✓ 环境创建成功
-- ✓ 交互测试成功
-- ✓ 智能体创建和更新成功
-
-### 2. 快速开始训练（推荐用于调试）
-
-```bash
-# 运行50个episodes的快速训练
-python quick_start.py --episodes 50 --length 50
-
-# 或运行100个episodes
-python quick_start.py --episodes 100 --length 100
-```
-
-### 3. 完整IPPO基线训练（Stage 1）
-
-```bash
-# 使用默认配置训练
-python train_ippo.py --config configs/default_config.yaml
-
-# 自定义实验名称
-python train_ippo.py --config configs/default_config.yaml --name my_experiment
-
-# 自定义episode数量
-python train_ippo.py --config configs/default_config.yaml --episodes 1000
-```
-
-## 关键概念
-
-### 环境状态空间
-- 任务信息：CPU周期、数据大小、deadline、到达时间
-- 设备状态：可用CPU、能量消耗、任务队列长度
-- 网络状态：各边缘服务器的利用率
-
-### 动作空间
-- 0: 在本地设备执行 (local execution)
-- 1~n: 卸载到第1~n个边缘服务器 (offload to edge server)
-
-### 奖励机制
-包含多个目标的加权奖励：
-- 任务完成比例 (40%)
-- 能量效率 (30%)
-- Deadline惩罚 (20%)
-- 公平性 (10%)
-
-### 智能体架构
-- Actor-Critic 网络
-- 共享特征提取层
-- 独立的策略头和值估计头
-
-## 配置文件说明
-
-### default_config.yaml
-默认配置包含：
-- 环境参数：设备数量、任务参数、网络参数
-- MARL参数：算法选择、网络结构、通信设置
-- 训练参数：学习率、折扣因子、PPO裁剪比率
-- 奖励权重：各目标的权重比例
-- 评估指标：任务成功率、能量消耗、延迟、公平性
-
-### explaboff_config.yaml
-Explaboff方案配置：
-- 启用智能体间通信
-- 互信息最大化权重
-- 注意力机制用于通信
-- 可解释性设置
-
-## TensorBoard 可视化
-
-训练过程中自动生成TensorBoard日志：
-
-```bash
-# 查看训练进度（训练过程中运行）
-tensorboard --logdir=./logs
-```
-
-在浏览器打开 http://localhost:6006 查看：
-- 每个智能体的损失函数
-- 奖励曲线
-- 评估指标
-
-## 输出文件
-
-训练完成后，结果保存在 `results/<experiment_name>/` 目录：
-- `config.yaml`: 训练使用的配置
-- `results.json`: 最终评估指标
-- `results.txt`: 易读的结果格式
-- `checkpoints/`: 模型检查点
-- `logs/`: TensorBoard日志
-
-## 主要评估指标
-
-1. **Task Completion Rate**: 成功完成的任务比例
-2. **Energy Consumption**: 总能量消耗
-3. **Average Task Delay**: 平均任务延迟
-4. **Deadline Miss Rate**: 未按期限完成的任务比例  
-5. **Fairness Index**: Jain公平性指数（衡量资源分配公平性）
-6. **Mutual Information** (Explaboff): 智能体间的互信息量
-7. **Explainability Score** (Explaboff): 策略可解释性得分
-
 ## 常见问题
 
-### GPU相关
-
-**Q: CUDA out of memory 错误**  
-A: 使用优化版本：
+**Q: CUDA out of memory**
 ```bash
-python train_ippo_lowmem.py --episodes 500
-```
-或参考 [GPU快速参考卡](GPU_QUICK_REFERENCE.md) 调整参数。
-
-**Q: 我的显卡不是RTX 4060 Ti，优化版本可用吗？**  
-A: 可以！train_ippo_lowmem.py 对所有GPU都有效。低显存配置也支持其他卡：
-- RTX 3060: 推荐使用 lowmem_config.yaml
-- RTX 4070+: 可尝试 default_config.yaml
-- A100: 支持最大的配置参数
-
-**Q: 如何查看当前显存占用？**  
-A: 运行诊断工具：
-```bash
-python diagnose_gpu.py
+python train_ippo.py --config configs/lowmem_config.yaml
+# 或强制 CPU
+python train_scalable.py --device cpu --num_agents 20
 ```
 
-### 一般问题
-
-### Q: ImportError: No module named 'torch'
-A: 确保已激活conda环境并安装了依赖：
+**Q: ImportError: No module named 'pettingzoo'**
 ```bash
-conda activate marl-edge
-pip install -r requirements.txt
+pip install pettingzoo>=1.25.0
 ```
 
-### Q: CUDA not available, falling back to CPU
-A: 这是正常的。如果你有GPU并想使用，确保已安装GPU版本的PyTorch：
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+**Q: 训练不收敛**
+```yaml
+# 调整 configs/default_config.yaml
+algorithm:
+  learning_rate: 5e-5   # 降低学习率
+  entropy_coeff: 0.05   # 增加探索
 ```
 
-### Q: 训练速度很慢
-A: 
-- 使用GPU版本 (安装CUDA支持的PyTorch)
-- 使用 `quick_start.py` 进行快速测试
-- 减少episode数量和长度
-- 使用较小的网络 (hidden_dim=64)
-- 减少智能体数量
-- 启用混合精度 (use_mixed_precision=true)
+---
 
-## 后续工作
+## 依赖
 
-- [ ] 实现Explaboff方案（互信息通信）
-- [ ] 大规模场景优化
-- [ ] GUI可视化界面
-- [ ] 与其他MARL算法对比（QMIX, MADDPG等）
-- [ ] 真实边缘计算场景的评估
+```
+torch>=1.13.0
+pettingzoo>=1.25.0
+gymnasium>=0.27.0
+numpy>=1.21.0
+matplotlib>=3.5.0
+tensorboard>=2.10.0
+pyyaml>=6.0
+networkx>=2.8
+tqdm>=4.64.0
+```
 
-## 参考资源
+---
 
-- PyTorch: https://pytorch.org
-- Gymnasium: https://gymnasium.farama.org
-- PPO论文: https://arxiv.org/abs/1707.06347
-- MARL综述: https://arxiv.org/abs/1908.03963
+## 参考
 
-## 作者
+- PPO 论文：https://arxiv.org/abs/1707.06347
+- MARL 综述：https://arxiv.org/abs/1908.03963
+- PettingZoo 文档：https://pettingzoo.farama.org
+- PyTorch 文档：https://pytorch.org/docs
 
-MARL Edge Offloading Project Team
+---
 
 ## 许可证
 

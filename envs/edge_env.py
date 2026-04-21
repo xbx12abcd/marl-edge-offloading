@@ -1,396 +1,342 @@
 """
-Edge Computing Network Environment for MARL.
-This environment simulates the task offloading problem in edge computing.
+Edge computing environments for MARL edge offloading.
+
+The canonical implementation is a PettingZoo ParallelEnv used by the main
+training script. A compatibility wrapper keeps the older single-agent API
+available for low-memory scripts.
 """
 
+from typing import Any, Dict, Optional
+import random
+
 import numpy as np
-import gymnasium as gym
 from gymnasium import spaces
-from typing import Dict, List, Tuple, Any, Optional
-import networkx as nx
-from utils import (
-    Task, Device, create_task_batch, 
-    calculate_transmission_delay, calculate_computation_time,
-    calculate_energy_consumption, compute_fairness_index
-)
+from pettingzoo import ParallelEnv
 
 
-class EdgeComputingEnv(gym.Env):
-    """
-    Multi-agent edge computing environment.
-    
-    This environment represents a network with:
-    - Multiple end devices generating computational tasks
-    - Multiple edge servers for task offloading
-    - Communication network with limited bandwidth
-    - Energy constraints for devices
-    
-    Observation space:
-    - Task information (CPU, data, deadline)
-    - Device resource status (available CPU, energy)
-    - Network state (bandwidth, queue length)
-    
-    Action space:
-    - Binary offloading decision per task
-    - Target edge server selection
-    """
-    
-    metadata = {"render_modes": []}
-    
+class EdgeOffloadingEnv(ParallelEnv):
+    """PettingZoo Parallel API edge offloading environment."""
+
+    metadata = {"name": "edge_offloading_v0"}
+
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize the environment.
-        
-        Args:
-            config: Configuration dictionary
-        """
         self.config = config
-        
-        # Extract configuration
-        self.num_edge_servers = config['environment']['num_edge_servers']
-        self.num_end_devices = config['environment']['num_end_devices']
-        self.num_time_slots = config['environment']['num_time_slots']
-        self.episode_length = config['marl']['episode_length']
-        
-        # Task parameters
-        self.num_tasks = config['environment']['num_tasks']
+        self._validate_config()
+
+        num_agents = config["environment"]["num_end_devices"]
+        self.possible_agents = [f"agent_{i}" for i in range(num_agents)]
+        self.agents = self.possible_agents[:]
+
+        self.num_edge_servers = config["environment"]["num_edge_servers"]
+        self.episode_length = config["marl"]["episode_length"]
+        self.state_dim = config["environment"]["state_dim"]
+
+        self.device_cpu_capacity = config["environment"]["device_cpu_capacity"]
+        self.server_cpu_capacity = config["environment"]["server_cpu_capacity"]
+        self.bandwidth_wireless = config["environment"]["bandwidth_wireless"]
+        self.transmission_delay = config["environment"]["transmission_delay"]
+        self.device_energy_per_cpu = config["environment"]["device_energy_per_cpu"]
+        self.server_energy_per_cpu = config["environment"]["server_energy_per_cpu"]
+        self.device_energy_per_bit = config["environment"]["device_energy_per_bit"]
+
         self.task_cpu_range = (
-            config['environment']['task_cpu_min'],
-            config['environment']['task_cpu_max']
+            config["environment"]["task_cpu_min"],
+            config["environment"]["task_cpu_max"],
         )
         self.task_data_range = (
-            config['environment']['task_data_min'],
-            config['environment']['task_data_max']
+            config["environment"]["task_data_min"],
+            config["environment"]["task_data_max"],
         )
         self.task_deadline_range = (
-            config['environment']['task_deadline_min'],
-            config['environment']['task_deadline_max']
+            config["environment"]["task_deadline_min"],
+            config["environment"]["task_deadline_max"],
         )
-        
-        # Network parameters
-        self.bandwidth_wireless = config['environment']['bandwidth_wireless']
-        self.bandwidth_wired = config['environment']['bandwidth_wired']
-        self.transmission_delay = config['environment']['transmission_delay']
-        
-        # Computation resources
-        self.device_cpu_capacity = config['environment']['device_cpu_capacity']
-        self.server_cpu_capacity = config['environment']['server_cpu_capacity']
-        
-        # Energy parameters
-        self.device_energy_per_cpu = config['environment']['device_energy_per_cpu']
-        self.device_energy_per_bit = config['environment']['device_energy_per_bit']
-        self.server_energy_per_cpu = config['environment']['server_energy_per_cpu']
-        
-        # Reward weights
-        self.reward_weights = config['reward']
-        
-        # Initialize devices
-        self.end_devices: List[Device] = []
-        self.edge_servers: List[Device] = []
-        self.all_devices: List[Device] = []
-        self._init_devices()
-        
-        # Initialize tasks
-        self.tasks: List[Task] = []
-        self.task_queue: List[Task] = []
-        
-        # Observation and action spaces
-        self.state_dim = config['environment']['state_dim']
-        self.observation_space = spaces.Box(
+
+        self.reward_weights = config["reward"]
+        self._adjacency_matrix = self._compute_distance_matrix()
+
+        self._action_space = spaces.Discrete(self.num_edge_servers + 1)
+        self._observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.state_dim,), dtype=np.float32
         )
-        
-        # Action space: offload decision and target server selection
-        self.action_space = spaces.Discrete(self.num_edge_servers + 1)  # 0=local, 1..n=edge servers
-        
-        # Statistics
-        self.current_time = 0
-        self.completed_tasks = 0
-        self.failed_tasks = 0
-        self.total_energy = 0.0
-        self.total_delay = 0.0
-        
-        # Network topology
-        self.network_graph = self._build_network_graph()
-    
-    def _init_devices(self):
-        """Initialize end devices and edge servers."""
-        # Initialize end devices
-        for i in range(self.num_end_devices):
-            device = Device(
-                device_id=i,
-                device_type='end_device',
-                cpu_capacity=self.device_cpu_capacity,
-                energy_budget=float('inf'),  # No energy constraint for now
-                location=(np.random.uniform(0, 100), np.random.uniform(0, 100))
-            )
-            self.end_devices.append(device)
-            self.all_devices.append(device)
-        
-        # Initialize edge servers
-        for i in range(self.num_edge_servers):
-            device = Device(
-                device_id=self.num_end_devices + i,
-                device_type='edge_server',
-                cpu_capacity=self.server_cpu_capacity,
-                energy_budget=float('inf'),
-                location=(np.random.uniform(0, 100), np.random.uniform(0, 100))
-            )
-            self.edge_servers.append(device)
-            self.all_devices.append(device)
-    
-    def _build_network_graph(self) -> nx.Graph:
-        """Build the network topology graph."""
-        G = nx.Graph()
-        
-        # Add all devices as nodes
-        for device in self.all_devices:
-            G.add_node(device.device_id)
-        
-        # Add edges between devices (fully connected for simplicity)
-        for i in range(len(self.all_devices)):
-            for j in range(i + 1, len(self.all_devices)):
-                distance = np.linalg.norm(
-                    np.array(self.all_devices[i].location) - 
-                    np.array(self.all_devices[j].location)
-                )
-                G.add_edge(i, j, weight=distance)
-        
-        return G
-    
-    def _get_communication_delay(self, src_device_id: int, dst_device_id: int, data_size: float) -> float:
-        """Get communication delay between two devices."""
-        src_device = self.all_devices[src_device_id]
-        dst_device = self.all_devices[dst_device_id]
-        
-        # Determine bandwidth based on device types
-        if src_device.device_type == 'end_device' and dst_device.device_type == 'edge_server':
-            bandwidth = self.bandwidth_wireless
-        elif src_device.device_type == 'edge_server' and dst_device.device_type == 'end_device':
-            bandwidth = self.bandwidth_wireless
-        else:
-            bandwidth = self.bandwidth_wired
-        
-        # Calculate distance-based delay
-        distance = np.linalg.norm(
-            np.array(src_device.location) - np.array(dst_device.location)
-        )
-        propagation_delay = distance / 1e8  # Light speed in medium
-        
-        # Calculate transmission delay
-        transmission_delay = calculate_transmission_delay(data_size, bandwidth)
-        
-        return propagation_delay + transmission_delay
-    
-    def _generate_tasks(self, num_tasks: int, current_time: int) -> List[Task]:
-        """Generate new tasks at current time step."""
-        tasks = create_task_batch(
-            num_tasks=num_tasks,
-            cpu_range=self.task_cpu_range,
-            data_range=self.task_data_range,
-            deadline_range=self.task_deadline_range,
-            task_id_start=len(self.tasks)
-        )
-        
-        for task in tasks:
-            task.arrival_time = current_time
-        
-        return tasks
-    
-    def _get_state(self, task: Task, device: Device) -> np.ndarray:
-        """Get normalized state representation for a task at a device."""
-        state = np.zeros(self.state_dim, dtype=np.float32)
-        
-        # Task features (normalized)
-        state[0] = np.tanh(task.cpu_cycles / 1000.0)
-        state[1] = np.tanh(task.data_size / 50.0)
-        state[2] = np.tanh(task.deadline / 50.0)
-        state[3] = np.tanh((self.current_time - task.arrival_time) / 100.0)
-        
-        # Current device status
-        cpu_util = device.current_cpu_usage / device.cpu_capacity
-        state[4] = np.tanh(cpu_util)
-        state[5] = np.tanh(device.get_available_cpu() / device.cpu_capacity)
-        state[6] = np.tanh(device.energy_consumed / max(device.energy_budget, 1.0))
-        
-        # Queue information
-        queue_length = len(device.tasks_queue)
-        state[7] = np.tanh(queue_length / 10.0)
-        
-        # Network status for each edge server
-        for i, edge_server in enumerate(self.edge_servers):
-            if i < self.state_dim - 8:
-                server_util = edge_server.current_cpu_usage / edge_server.cpu_capacity
-                state[8 + i] = np.tanh(server_util)
-        
-        # Padding
-        state = state[:self.state_dim]
-        
-        return state
-    
-    def reset(self, seed: Optional[int] = None):
-        """Reset the environment to initial state."""
-        super().reset(seed=seed)
-        
-        # Reset all devices
-        for device in self.all_devices:
-            device.reset()
-        
-        # Clear task list and queue
-        self.tasks.clear()
-        self.task_queue.clear()
-        
-        # Reset statistics
-        self.current_time = 0
-        self.completed_tasks = 0
-        self.failed_tasks = 0
-        self.total_energy = 0.0
-        self.total_delay = 0.0
-        
-        # Generate initial tasks
-        initial_tasks = self._generate_tasks(self.num_tasks, self.current_time)
-        self.tasks.extend(initial_tasks)
-        self.task_queue.extend(initial_tasks)
-        
-        return self._get_state(self.task_queue[0], self.end_devices[0]), {}
-    
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """
-        Execute one step in the environment.
-        
-        Args:
-            action: Offloading decision (0=local, 1..n=edge server i-1)
-        
-        Returns:
-            observation, reward, terminated, truncated, info
-        """
-        # Process current task scheduling decision
-        if self.task_queue:
-            task = self.task_queue.pop(0)
-            reward = self._schedule_task(task, action)
-        else:
-            reward = -1.0
-        
-        # Simulate one time step
-        self._simulate_time_step()
-        
-        # Check termination
-        terminated = self.current_time >= self.episode_length or not self.task_queue
-        truncated = False
-        
-        # Get next observation
-        if self.task_queue:
-            next_obs = self._get_state(self.task_queue[0], self.end_devices[0])
-        else:
-            next_obs = np.zeros(self.state_dim, dtype=np.float32)
-        
-        # Prepare info dict
-        info = {
-            'completed_tasks': self.completed_tasks,
-            'failed_tasks': self.failed_tasks,
-            'total_energy': self.total_energy,
-            'total_delay': self.total_delay
+        self.observation_spaces = {
+            agent: self._observation_space for agent in self.possible_agents
         }
-        
-        return next_obs, float(reward), terminated, truncated, info
-    
-    def _schedule_task(self, task: Task, action: int) -> float:
-        """
-        Schedule a task to a device and calculate reward.
-        
-        Args:
-            task: Task to schedule
-            action: Target device (0=local, 1..n=edge server)
-        
-        Returns:
-            Reward for this action
-        """
+        self.action_spaces = {
+            agent: self._action_space for agent in self.possible_agents
+        }
+
+        self.current_step = 0
+        self._reset_internal()
+        self.render_mode = None
+
+    @property
+    def num_agents(self) -> int:
+        return len(self.possible_agents)
+
+    def _validate_config(self):
+        for key in ["environment", "marl", "reward"]:
+            if key not in self.config:
+                raise ValueError(f"Missing config key: {key}")
+
+    def _compute_distance_matrix(self) -> np.ndarray:
+        n = len(self.possible_agents) + self.num_edge_servers
+        adj = np.zeros((n, n), dtype=np.float32)
+        locations = [(random.uniform(0, 100), random.uniform(0, 100)) for _ in range(n)]
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    dx = locations[i][0] - locations[j][0]
+                    dy = locations[i][1] - locations[j][1]
+                    adj[i, j] = np.sqrt(dx * dx + dy * dy)
+        return adj
+
+    def _reset_internal(self):
+        self.tasks = {
+            agent: self._generate_task(int(agent.split("_")[1]))
+            for agent in self.possible_agents
+        }
+        self.server_loads = np.zeros(self.num_edge_servers, dtype=np.float32)
+        self.server_energies = np.zeros(self.num_edge_servers, dtype=np.float32)
+        self.agent_queues = {agent: [] for agent in self.possible_agents}
+        self.agent_energies = {agent: 100.0 for agent in self.possible_agents}
+        self.current_step = 0
+        self.episode_rewards = {agent: 0.0 for agent in self.possible_agents}
+        self.completed_tasks = {agent: 0 for agent in self.possible_agents}
+        self.failed_tasks = {agent: 0 for agent in self.possible_agents}
+        self.total_energy = 0.0
+        self.total_delay = 0.0
+
+    def _generate_task(self, agent_id: int = 0) -> Dict[str, Any]:
+        return {
+            "id": agent_id,
+            "cpu_cycles": random.uniform(
+                self.task_cpu_range[0], self.task_cpu_range[1]
+            ),
+            "data_size": random.uniform(
+                self.task_data_range[0], self.task_data_range[1]
+            ),
+            "deadline": random.randint(
+                self.task_deadline_range[0], self.task_deadline_range[1]
+            ),
+            "arrival_time": self.current_step,
+            "completed": False,
+            "completion_time": None,
+        }
+
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+        self._reset_internal()
+        self.agents = self.possible_agents[:]
+        observations = {agent: self._get_observation(agent) for agent in self.agents}
+        infos = {agent: {} for agent in self.agents}
+        return observations, infos
+
+    def _get_observation(self, agent: str) -> np.ndarray:
+        obs = np.zeros(self.state_dim, dtype=np.float32)
+        task = self.tasks[agent]
+        obs[0] = np.tanh(task["cpu_cycles"] / 1000.0)
+        obs[1] = np.tanh(task["data_size"] / 50.0)
+        obs[2] = np.tanh(task["deadline"] / 50.0)
+        obs[3] = np.tanh((self.current_step - task["arrival_time"]) / 100.0)
+        obs[4] = np.tanh(len(self.agent_queues[agent]) / 10.0)
+        for i in range(min(self.num_edge_servers, self.state_dim - 5)):
+            obs[5 + i] = np.tanh(self.server_loads[i])
+        obs[-2] = np.tanh(self.current_step / max(self.episode_length, 1))
+        remaining = sum(1 for item in self.tasks.values() if not item["completed"])
+        obs[-1] = np.tanh(remaining / max(len(self.tasks), 1))
+        return obs
+
+    def step(self, actions: Dict[str, int]):
+        if not set(actions.keys()).issubset(set(self.agents)):
+            raise ValueError(
+                "Action keys must be a subset of active agents; extra keys are not "
+                "allowed and missing agents default to action 0"
+            )
+
+        observations, rewards, terminations, truncations, infos = {}, {}, {}, {}, {}
+        completed_flags = {}
+        for agent in self.agents:
+            action = actions.get(agent, 0)
+            reward = self._execute_action(agent, action)
+            completed_flags[agent] = self.tasks[agent]["completed"]
+            rewards[agent] = reward
+            terminations[agent] = False
+            truncations[agent] = False
+            self.episode_rewards[agent] += reward
+
+        self.server_loads *= 0.95
+        self.server_loads = np.clip(self.server_loads, 0, 1)
+
+        self.current_step += 1
+
+        for agent in self.agents:
+            if self.tasks[agent]["completed"]:
+                self.tasks[agent] = self._generate_task(int(agent.split("_")[1]))
+
+        if self.current_step >= self.episode_length:
+            for agent in self.agents:
+                truncations[agent] = True
+
+        for agent in self.agents:
+            observations[agent] = self._get_observation(agent)
+            infos[agent] = {
+                "completed": completed_flags[agent],
+                "server_loads": self.server_loads.copy(),
+            }
+
+        return observations, rewards, terminations, truncations, infos
+
+    def _execute_action(self, agent: str, action: int) -> float:
+        task = self.tasks[agent]
+        if task["completed"]:
+            return 0.0
+
         if action == 0:
-            # Execute locally on the source device (first end device for now)
-            target_device = self.end_devices[0]
+            return self._local_execution(agent, task)
+
+        server_id = max(0, min(self.num_edge_servers - 1, action - 1))
+        return self._offload_execution(agent, task, server_id)
+
+    def _local_execution(self, agent: str, task: Dict[str, Any]) -> float:
+        compute_time = task["cpu_cycles"] / max(self.device_cpu_capacity, 1e-6)
+        energy = (
+            task["cpu_cycles"] * self.device_energy_per_cpu
+            + task["data_size"] * self.device_energy_per_bit
+        )
+
+        self.total_energy += energy
+        self.total_delay += compute_time
+
+        success = compute_time <= task["deadline"]
+        if success:
+            self.completed_tasks[agent] += 1
+            task["completed"] = True
+            reward = (
+                self.reward_weights.get("task_completion_weight", 1.0)
+                - abs(self.reward_weights.get("energy_penalty_per_unit", 0.001))
+                * energy
+                - abs(self.reward_weights.get("deadline_penalty_weight", 0.1))
+                * compute_time
+            )
         else:
-            # Offload to edge server
-            target_device = self.edge_servers[min(action - 1, len(self.edge_servers) - 1)]
-        
-        # Check if device has sufficient resources
-        if target_device.get_available_cpu() < task.cpu_cycles:
-            # Cannot schedule - queue task
-            self.task_queue.append(task)
-            reward = -1.0
+            self.failed_tasks[agent] += 1
+            reward = self.reward_weights.get("deadline_miss_penalty", -10.0)
+        return float(reward)
+
+    def _offload_execution(
+        self, agent: str, task: Dict[str, Any], server_id: int
+    ) -> float:
+        agent_index = int(agent.split("_")[1])
+        distance = self._adjacency_matrix[
+            agent_index, len(self.possible_agents) + server_id
+        ]
+        tx_delay = (
+            task["data_size"] / max(self.bandwidth_wireless, 1e-6)
+            + self.transmission_delay
+            + distance * 1e-4
+        )
+        queue_penalty = self.server_loads[server_id] * 2.0
+        compute_time = task["cpu_cycles"] / max(self.server_cpu_capacity, 1e-6)
+        total_delay = tx_delay + queue_penalty + compute_time
+        energy = (
+            task["data_size"] * self.device_energy_per_bit
+            + task["cpu_cycles"] * self.server_energy_per_cpu
+        )
+
+        self.server_loads[server_id] += min(
+            0.2, task["cpu_cycles"] / max(self.server_cpu_capacity, 1e-6)
+        )
+        self.server_energies[server_id] += energy
+        self.total_energy += energy
+        self.total_delay += total_delay
+
+        success = total_delay <= task["deadline"]
+        if success:
+            self.completed_tasks[agent] += 1
+            task["completed"] = True
+            reward = (
+                self.reward_weights.get("task_completion_weight", 1.0)
+                + self.reward_weights.get("fairness_weight", 0.1)
+                * (1.0 - float(np.std(self.server_loads)))
+                - abs(self.reward_weights.get("energy_penalty_per_unit", 0.001))
+                * energy
+                - abs(self.reward_weights.get("deadline_penalty_weight", 0.1))
+                * total_delay
+            )
         else:
-            # Schedule task
-            task.offloaded_to = target_device.device_id
-            target_device.tasks_queue.append(task)
-            target_device.current_cpu_usage += task.cpu_cycles
-            reward = 0.0  # Successful scheduling reward
-        
-        return reward
-    
-    def _simulate_time_step(self):
-        """Simulate one time step: process tasks and update device states."""
-        self.current_time += 1
-        
-        # Process tasks on each device
-        for device in self.all_devices:
-            if device.tasks_queue:
-                task = device.tasks_queue[0]
-                
-                # Calculate execution time
-                if device.device_type == 'end_device':
-                    # device_cpu_capacity is in million cycles per time slot
-                    available_cycles = self.device_cpu_capacity - device.current_cpu_usage
-                    if available_cycles >= task.cpu_cycles:
-                        execution_time = 1.0  # Complete in this time slot
-                    else:
-                        execution_time = 2.0  # Need more time
-                    energy_per_cpu = self.device_energy_per_cpu
-                else:
-                    # server_cpu_capacity is in million cycles per time slot
-                    available_cycles = self.server_cpu_capacity - device.current_cpu_usage
-                    if available_cycles >= task.cpu_cycles:
-                        execution_time = 1.0  # Complete in this time slot
-                    else:
-                        execution_time = 2.0  # Need more time
-                    energy_per_cpu = self.server_energy_per_cpu
-                
-                # If task completes
-                if execution_time <= 1.0:  # Simplified: 1 time slot
-                    device.tasks_queue.pop(0)
-                    task.completed = True
-                    task.completion_time = self.current_time
-                    
-                    # Calculate metrics
-                    task.latency = task.completion_time - task.arrival_time
-                    task.energy_consumed = calculate_energy_consumption(
-                        task.cpu_cycles, energy_per_cpu,
-                        task.data_size * 8e6, self.device_energy_per_bit
-                    )
-                    
-                    # Update statistics
-                    if not task.is_deadline_missed(task.completion_time):
-                        task.deadline_met = True
-                        self.completed_tasks += 1
-                    else:
-                        self.failed_tasks += 1
-                    
-                    self.total_energy += task.energy_consumed
-                    self.total_delay += task.latency
-                    device.energy_consumed += task.energy_consumed
-                    device.current_cpu_usage = max(0, device.current_cpu_usage - task.cpu_cycles)
-    
+            self.failed_tasks[agent] += 1
+            reward = self.reward_weights.get("deadline_miss_penalty", -10.0)
+        return float(reward)
+
     def get_metrics(self) -> Dict[str, float]:
-        """Get current performance metrics."""
-        total_tasks = self.completed_tasks + self.failed_tasks
-        
-        metrics = {
-            'task_completion_rate': self.completed_tasks / max(total_tasks, 1),
-            'energy_consumption': self.total_energy,
-            'average_delay': self.total_delay / max(total_tasks, 1),
-            'deadline_miss_rate': self.failed_tasks / max(total_tasks, 1),
+        completed = sum(self.completed_tasks.values())
+        failed = sum(self.failed_tasks.values())
+        total = completed + failed
+        completion_rate = completed / max(total, 1)
+        deadline_miss_rate = failed / max(total, 1)
+        avg_delay = self.total_delay / max(total, 1)
+        loads = self.server_loads + 1e-8
+        fairness = (np.sum(loads) ** 2) / (len(loads) * np.sum(loads ** 2))
+        return {
+            "task_completion_rate": float(completion_rate),
+            "energy_consumption": float(self.total_energy),
+            "average_delay": float(avg_delay),
+            "deadline_miss_rate": float(deadline_miss_rate),
+            "fairness_index": float(fairness),
         }
-        
-        # Fairness index
-        device_energy_list = [d.energy_consumed for d in self.all_devices]
-        metrics['fairness_index'] = compute_fairness_index(device_energy_list)
-        
-        return metrics
+
+    def render(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class EdgeComputingEnv:
+    """Compatibility wrapper for older single-agent scripts."""
+
+    def __init__(self, config: Dict[str, Any]):
+        self._env = EdgeOffloadingEnv(config)
+        self.num_end_devices = len(self._env.possible_agents)
+        self.num_edge_servers = self._env.num_edge_servers
+        self.num_time_slots = config["environment"].get(
+            "num_time_slots", self._env.episode_length
+        )
+        self.num_tasks = config["environment"].get("num_tasks", self.num_end_devices)
+        self.action_space = self._env.action_spaces[self._env.possible_agents[0]]
+        self.observation_space = self._env.observation_spaces[
+            self._env.possible_agents[0]
+        ]
+        self.metadata = getattr(self._env, "metadata", {})
+
+    def reset(self, seed: Optional[int] = None):
+        observations, infos = self._env.reset(seed=seed)
+        first_agent = self._env.possible_agents[0]
+        return observations[first_agent], infos[first_agent]
+
+    def step(self, action: int):
+        first_agent = self._env.possible_agents[0]
+        actions = {agent: 0 for agent in self._env.possible_agents}
+        actions[first_agent] = action
+        observations, rewards, terminations, truncations, infos = self._env.step(
+            actions
+        )
+        return (
+            observations[first_agent],
+            rewards[first_agent],
+            terminations[first_agent],
+            truncations[first_agent],
+            infos[first_agent],
+        )
+
+    def get_metrics(self) -> Dict[str, float]:
+        return self._env.get_metrics()
+
+    def render(self):
+        return self._env.render()
+
+    def close(self):
+        return self._env.close()
